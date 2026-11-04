@@ -264,6 +264,9 @@ export function LookupPage() {
   const [catalog, setCatalog] = useState<Catalog|null>(null);
   const [newDate, setNewDate] = useState('');
   const [newTimeSlot, setNewTimeSlot] = useState('');
+  const [rescheduleAvailability, setRescheduleAvailability] = useState<{timeSlots:string[];unavailable:string[]}|null>(null);
+  const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [availabilityError, setAvailabilityError] = useState('');
   const [reason, setReason] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -313,6 +316,22 @@ export function LookupPage() {
   const canReschedule = booking?.status==='CONFIRMED' && booking.payment_status==='PAID';
   const pending = requests.some(r=>r.status==='PENDING');
   const cancelPending=cancellations.some(r=>r.status==='PENDING');
+  useEffect(() => {
+    setRescheduleAvailability(null);
+    setAvailabilityError('');
+    if (!canReschedule || !newDate || !booking || pending || cancelPending) {
+      setAvailabilityLoading(false);
+      return;
+    }
+    let active = true;
+    setAvailabilityLoading(true);
+    void api<{timeSlots:string[];unavailable:string[]}>(
+      `/bookings/${encodeURIComponent(booking.booking_code)}/reschedule-availability?phone=${encodeURIComponent(phone)}&date=${encodeURIComponent(newDate)}`)
+      .then(data => { if (active) setRescheduleAvailability(data); })
+      .catch(e => { if (active) setAvailabilityError(e instanceof Error ? e.message : 'Không kiểm tra được lịch trống.'); })
+      .finally(() => { if (active) setAvailabilityLoading(false); });
+    return () => { active = false; };
+  }, [booking, newDate, canReschedule, pending, cancelPending, phone]);
   const requestLabels:Record<string,string> = {PENDING:'Đang chờ duyệt',APPROVED:'Đã chấp thuận',REJECTED:'Đã từ chối',CANCELLED:'Đã hủy'};
   return <section className="narrow-page"><div className="page-intro"><span className="eyebrow">TRA CỨU ĐẶT PHÒNG</span><h1>Đơn đặt phòng của bạn.</h1><p>Nhập mã đặt phòng và số điện thoại đã đăng ký để bảo vệ thông tin cá nhân. Khách hàng không cần tạo tài khoản.</p></div>
     <div className="panel"><form onSubmit={lookup}><label>Mã đặt phòng<input className="code-input" value={code} onChange={e=>setCode(e.target.value)} placeholder="HB-1004112006" required/></label>
@@ -327,9 +346,22 @@ export function LookupPage() {
         {!requests.length&&<p>Chưa có yêu cầu đổi lịch.</p>}
         {canReschedule && !pending && !cancelPending && <form onSubmit={submitReschedule} className="reschedule-form"><h3>Gửi đề nghị đổi lịch</h3><p>Lịch cũ chỉ thay đổi sau khi nhân viên hoặc chủ quán duyệt.</p>
           <label>Ngày đề xuất<input type="date" min={today()} value={newDate} onChange={e=>{setNewDate(e.target.value);setNewTimeSlot('');}} required/></label>
-          <label>Giờ đề xuất<select value={newTimeSlot} onChange={e=>setNewTimeSlot(e.target.value)} required><option value="">Chọn giờ</option>{catalog?.timeSlots.map(slot=><option key={slot} value={slot}>{slot}</option>)}</select></label>
+          <div className="reschedule-time-picker"><strong>Chọn giờ đề xuất còn trống</strong>
+            {!newDate && <p className="field-hint">Chọn ngày để xem những khung giờ có thể đề xuất.</p>}
+            {availabilityLoading && <p className="field-hint" role="status">Đang kiểm tra khung giờ...</p>}
+            {availabilityError && <div className="error-box" role="alert">{availabilityError} <button className="button light tiny" type="button" onClick={()=>{setNewDate('');setNewTimeSlot('');}}>Chọn lại ngày</button></div>}
+            {rescheduleAvailability && <div className="time-slot-grid" role="group" aria-label="Chọn khung giờ đổi lịch">
+              {rescheduleAvailability.timeSlots.map(slot => { const unavailable = rescheduleAvailability.unavailable.includes(slot);
+                return <button type="button" key={slot} className={`time-slot ${newTimeSlot===slot?'selected':''}`}
+                  aria-pressed={newTimeSlot===slot} disabled={unavailable || loading} onClick={()=>setNewTimeSlot(slot)}
+                  title={unavailable?'Khung giờ không khả dụng':`Đề xuất ${slot}`}>{slot}{unavailable?' · Kín':''}</button>; })}
+            </div>}
+            {rescheduleAvailability && rescheduleAvailability.timeSlots.every(slot=>rescheduleAvailability.unavailable.includes(slot)) &&
+              <p className="field-hint">Ngày này không còn giờ phù hợp. Vui lòng chọn ngày khác.</p>}
+            <p className="field-hint">Giờ trống chỉ mang tính tham khảo; hệ thống kiểm tra lại khi nhân viên/chủ quán phê duyệt.</p>
+          </div>
           <label>Lý do đổi lịch<textarea value={reason} onChange={e=>setReason(e.target.value)} minLength={5} maxLength={500} required placeholder="Vui lòng nhập ít nhất 5 ký tự"/></label>
-          <button className="button primary full" disabled={loading || !catalog || !newTimeSlot}>Gửi yêu cầu đổi lịch</button>
+          <button className="button primary full" disabled={loading || availabilityLoading || !rescheduleAvailability || !newTimeSlot || rescheduleAvailability.unavailable.includes(newTimeSlot)}>Gửi yêu cầu đổi lịch</button>
         </form>}
         {pending&&<div className="notice notice-info">Đơn đang có yêu cầu chờ xét duyệt. Không thể tạo yêu cầu khác cho tới khi được xử lý.</div>}
         <hr/><h3>Hủy đặt phòng</h3>

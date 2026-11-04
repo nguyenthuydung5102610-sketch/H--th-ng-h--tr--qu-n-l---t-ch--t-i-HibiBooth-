@@ -10,7 +10,7 @@ import { validCustomerName, isValidDate, isBookableAt, checkinWindow, formatBook
 import { scheduleBookingEmails, startEmailNotificationWorker, isValidCustomerEmail, emailServiceEnabled } from './email-notifications.js';
 import { pool, writeAudit } from './db.js';
 import { requireAuth, requireRole } from './auth.js';
-import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, validateRescheduleDecision, canApproveReschedule } from './reschedule-rules.js';
+import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, validateRescheduleDecision, canApproveReschedule, unavailableRescheduleSlots } from './reschedule-rules.js';
 import { cancellationMode, isCancellationReasonValid } from './cancellation-rules.js';
 
 if (!process.env.JWT_SECRET) {
@@ -306,6 +306,40 @@ app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requi
       await client.query('COMMIT');
       res.json({message:decision==='APPROVE'?'Đã hủy đơn và tạo yêu cầu hoàn tiền để chủ quán xét duyệt. Chưa chuyển tiền.':'Đã từ chối yêu cầu; đơn vẫn giữ nguyên.'});
     } catch(error){await client.query('ROLLBACK');throw error;} finally{client.release();}
+  })
+);
+
+// COMMIT 06: Display available destinations before the customer submits a request.
+// The original booking is excluded because its slot will be released upon approval.
+// The decision API below still rechecks availability under a room lock.
+app.get('/api/bookings/:code/reschedule-availability',
+  rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }),
+  asyncHandler(async (req, res) => {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    const phone = normalizeCustomerPhone(req.query.phone);
+    const date = String(req.query.date || '');
+    if (!isBookingCode(code) || !phone) {
+      return res.status(400).json({ message: 'Mã đặt phòng hoặc số điện thoại không hợp lệ.' });
+    }
+    if (!isValidDate(date)) return res.status(400).json({ message: 'Ngày đề xuất không hợp lệ.' });
+
+    const found = await pool.query(
+      `SELECT id, room_id, status, payment_status, booking_date::text AS booking_date, time_slot
+       FROM bookings WHERE booking_code=$1 AND customer_phone=$2`, [code, phone]);
+    if (!found.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn hoặc số điện thoại không khớp.' });
+    const booking = found.rows[0];
+    if (!canRequestReschedule(booking.status, booking.payment_status)) {
+      return res.status(409).json({ message: 'Đơn không còn đủ điều kiện đổi lịch.' });
+    }
+    const booked = await pool.query(
+      `SELECT time_slot FROM bookings WHERE room_id=$1 AND booking_date=$2 AND id<>$3
+       AND status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN')
+       AND (status <> 'PENDING_PAYMENT' OR hold_expires_at > NOW())`,
+      [booking.room_id, date, booking.id]);
+    const unavailable = unavailableRescheduleSlots(TIME_SLOTS, booked.rows.map(row => row.time_slot), date);
+    // Moving to exactly the same date/time is not a valid reschedule request.
+    if (date === booking.booking_date && !unavailable.includes(booking.time_slot)) unavailable.push(booking.time_slot);
+    res.json({ date, timeSlots: TIME_SLOTS, unavailable });
   })
 );
 

@@ -108,3 +108,12 @@ body,button,input,select,textarea{font-family:'Be Vietnam Pro',Arial,sans-serif}
   width:min(100%,295px);min-height:105px;margin:4px auto 16px;text-align:center;
   border:1px dashed var(--line);border-radius:15px;background:#fffdf8;
   color:var(--muted);font-size:.9rem;padding:20px;line-height:1.5}
+
+/* Commit 06: Customer and management rescheduling enhancements */
+.reschedule-time-picker { margin: 8px 0 16px; }
+.reschedule-time-picker > strong { display: block; font-size: .82rem; margin: 0 0 11px; }
+.reschedule-time-picker .time-slot-grid { margin: 10px 0; }
+.reschedule-filter-row { display: grid; grid-template-columns: minmax(175px, 1fr) minmax(220px, 2fr) auto; gap: 12px; align-items: end; }
+.reschedule-filter-row label { margin: 0; }
+.reschedule-filter-row > button { margin-bottom: 0; }
+@media (max-width: 720px) { .reschedule-filter-row { grid-template-columns: 1fr; } }

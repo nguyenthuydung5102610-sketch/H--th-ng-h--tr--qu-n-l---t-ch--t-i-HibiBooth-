@@ -1,4 +1,4 @@
-import { isBookableAt, isValidDate } from './business-rules.js';
+import { isBookableAt, isValidDate, slotsOverlap } from './business-rules.js';
 
 export function normalizeCustomerPhone(value) {
   if (typeof value !== 'string') return null;
@@ -36,4 +36,10 @@ export function validateRescheduleDecision(input) {
 
 export function canApproveReschedule(date, slot, validSlots, nowMs = Date.now()) {
   return Array.isArray(validSlots) && validSlots.includes(slot) && isBookableAt(date, slot, nowMs);
+}
+
+// UI pre-check only. Server approval uses locks and always validates again.
+export function unavailableRescheduleSlots(timeSlots, reservedSlots, date, nowMs = Date.now()) {
+  return timeSlots.filter(slot => !isBookableAt(date, slot, nowMs) ||
+    reservedSlots.some(existing => slotsOverlap(slot, existing)));
 }
