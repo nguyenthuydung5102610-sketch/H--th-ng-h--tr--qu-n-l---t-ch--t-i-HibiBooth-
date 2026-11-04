@@ -1,0 +1,19 @@
+{
+  "name": "hibi-booth-fullstack",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -k \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w client",
+    "db:init": "npm run db:init -w server",
+    "db:seed": "npm run db:seed -w server",
+    "test:rules": "node --test server/tests/*.test.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
