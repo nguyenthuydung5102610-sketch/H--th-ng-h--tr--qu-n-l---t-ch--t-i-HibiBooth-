@@ -141,3 +141,36 @@ CREATE TABLE IF NOT EXISTS email_notifications (
   UNIQUE (booking_id, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_email_notifications_due ON email_notifications(status, due_at);
+
+-- COMMIT 02: Luu yeu cau doi lich, khong thay doi booking truoc khi phe duyet.
+-- Moi booking chi duoc co toi da mot yeu cau dang cho xu ly.
+CREATE TABLE IF NOT EXISTS booking_reschedule_requests (
+  id BIGSERIAL PRIMARY KEY,
+  booking_id BIGINT NOT NULL REFERENCES bookings(id),
+  requested_by VARCHAR(20) NOT NULL DEFAULT 'CUSTOMER'
+    CHECK (requested_by IN ('CUSTOMER', 'EMPLOYEE', 'OWNER')),
+  old_booking_date DATE NOT NULL,
+  old_time_slot VARCHAR(20) NOT NULL,
+  new_booking_date DATE NOT NULL,
+  new_time_slot VARCHAR(20) NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status VARCHAR(24) NOT NULL DEFAULT 'PENDING'
+    CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')),
+  reviewed_by INTEGER REFERENCES users(id),
+  decision_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reviewed_at TIMESTAMPTZ,
+  CONSTRAINT chk_reschedule_time_changed CHECK (
+    old_booking_date <> new_booking_date OR old_time_slot <> new_time_slot
+  ),
+  CONSTRAINT chk_reschedule_review_fields CHECK (
+    (status = 'PENDING' AND reviewed_by IS NULL AND reviewed_at IS NULL)
+    OR (status = 'CANCELLED' AND reviewed_by IS NULL AND reviewed_at IS NULL)
+    OR (status IN ('APPROVED', 'REJECTED') AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reschedule_one_pending_per_booking
+  ON booking_reschedule_requests (booking_id)
+  WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_reschedule_requests_status_created
+  ON booking_reschedule_requests (status, created_at DESC);
