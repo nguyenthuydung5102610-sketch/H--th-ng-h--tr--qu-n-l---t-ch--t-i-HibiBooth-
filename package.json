@@ -11,7 +11,8 @@
     "build": "npm run build -w client",
     "db:init": "npm run db:init -w server",
     "db:seed": "npm run db:seed -w server",
-    "test:rules": "node --test server/tests/*.test.js"
+    "test:rules": "node --test server/tests/*.test.js",
+    "setup:local": "node scripts/setup-local.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

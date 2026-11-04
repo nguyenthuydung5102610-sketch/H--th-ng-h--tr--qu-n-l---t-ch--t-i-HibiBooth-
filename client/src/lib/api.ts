@@ -1,4 +1,9 @@
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000/api';
+// In Vite development, call the same-origin /api proxy. This avoids CORS issues
+// when Vite changes ports (5173, 5174, 5175, ...) and works with localhost or LAN URLs.
+// In production, configure VITE_API_URL to the public API endpoint if needed.
+const API_URL = import.meta.env.DEV
+  ? '/api'
+  : (import.meta.env.VITE_API_URL || 'http://localhost:4000/api');
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers || {});

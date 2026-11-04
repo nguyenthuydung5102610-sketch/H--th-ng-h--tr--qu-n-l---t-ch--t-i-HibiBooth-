@@ -11,6 +11,7 @@ import { scheduleBookingEmails, startEmailNotificationWorker, isValidCustomerEma
 import { pool, writeAudit } from './db.js';
 import { requireAuth, requireRole } from './auth.js';
 import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, validateRescheduleDecision, canApproveReschedule } from './reschedule-rules.js';
+import { cancellationMode, isCancellationReasonValid } from './cancellation-rules.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -193,6 +194,121 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   res.json({ ...booking, customer_phone: maskPhone(booking.customer_phone), qr_content: canIssueCheckinQr(booking.status, booking.payment_status) ? `HIBI|${booking.booking_code}` : null });
 }));
 
+// COMMIT 06: customer cancellation. Unpaid holds are cancelled immediately;
+// paid bookings require a review and a separate owner refund approval.
+app.post('/api/bookings/:code/cancellation',
+  rateLimit({ windowMs: 15*60*1000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false }),
+  asyncHandler(async (req, res) => {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    const phone = normalizeCustomerPhone(req.body?.customerPhone);
+    const reason = String(req.body?.reason || '').trim();
+    if (!isBookingCode(code) || !phone) return res.status(400).json({message:'Mã đơn hoặc số điện thoại không hợp lệ.'});
+    if (!isCancellationReasonValid(reason)) return res.status(400).json({message:'Nhập lý do hủy từ 5 đến 500 ký tự.'});
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const found = await client.query(`SELECT id,status,payment_status,booking_date::text AS booking_date,time_slot,hold_expires_at
+        FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
+      if (!found.rowCount) { await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'}); }
+      const b=found.rows[0];
+      if (cancellationMode(b.status,b.payment_status)==='IMMEDIATE') {
+        // Hủy hold chưa thanh toán; không tạo yêu cầu hoàn tiền.
+        await client.query(`UPDATE bookings SET status='CANCELLED',updated_at=NOW() WHERE id=$1`,[b.id]);
+        await client.query(`UPDATE booking_reschedule_requests SET status='CANCELLED' WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
+        await writeAudit(client,null,'CUSTOMER_CANCEL_UNPAID','BOOKING',b.id,{bookingCode:code,reason});
+        await client.query('COMMIT');
+        return res.json({status:'CANCELLED',message:'Đã hủy đơn chưa thanh toán và giải phóng khung giờ.'});
+      }
+      if (cancellationMode(b.status,b.payment_status)!=='REVIEW') {
+        await client.query('ROLLBACK');return res.status(409).json({message:'Trạng thái đơn hiện tại không cho phép gửi yêu cầu hủy.'});
+      }
+      const existing=await client.query(`SELECT id FROM booking_cancellation_requests WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
+      if (existing.rowCount) {await client.query('ROLLBACK');return res.status(409).json({message:'Đơn đã có yêu cầu hủy đang chờ xét duyệt.'});}
+      const other=await client.query(`SELECT id FROM booking_reschedule_requests WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
+      if (other.rowCount) {await client.query('ROLLBACK');return res.status(409).json({message:'Vui lòng xử lý yêu cầu đổi lịch đang chờ trước khi hủy đơn.'});}
+      const created=await client.query(`INSERT INTO booking_cancellation_requests(booking_id,reason) VALUES($1,$2) RETURNING id,status`,[b.id,reason]);
+      await writeAudit(client,null,'CUSTOMER_REQUEST_CANCELLATION','CANCELLATION_REQUEST',created.rows[0].id,{bookingCode:code});
+      await client.query('COMMIT');
+      res.status(201).json({...created.rows[0],message:'Đã gửi yêu cầu hủy. Lịch hiện tại được giữ nguyên cho đến khi nhân viên hoặc chủ quán duyệt. Hoàn tiền phải được chủ quán duyệt riêng.'});
+    } catch(error) {await client.query('ROLLBACK');throw error;} finally {client.release();}
+  })
+);
+
+app.get('/api/bookings/:code/cancellation-requests',
+  rateLimit({windowMs:15*60*1000,limit:30,standardHeaders:'draft-8',legacyHeaders:false}),
+  asyncHandler(async (req,res)=>{
+    const code=String(req.params.code||'').trim().toUpperCase();
+    const phone=normalizeCustomerPhone(req.query.phone);
+    if(!isBookingCode(code)||!phone)return res.status(400).json({message:'Mã đơn hoặc số điện thoại không hợp lệ.'});
+    const result=await pool.query(`SELECT c.id,c.reason,c.status,c.decision_reason,c.created_at,c.reviewed_at
+      FROM booking_cancellation_requests c JOIN bookings b ON b.id=c.booking_id
+      WHERE b.booking_code=$1 AND b.customer_phone=$2 ORDER BY c.created_at DESC LIMIT 20`,[code,phone]);
+    const matches=await pool.query('SELECT 1 FROM bookings WHERE booking_code=$1 AND customer_phone=$2',[code,phone]);
+    if(!matches.rowCount)return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});
+    res.json({requests:result.rows});
+  })
+);
+
+app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYEE','OWNER'),
+  asyncHandler(async(req,res)=>{
+    const status=String(req.query.status||'PENDING').toUpperCase();
+    if(!['PENDING','APPROVED','REJECTED','ALL'].includes(status))return res.status(400).json({message:'Bộ lọc không hợp lệ.'});
+    const r=await pool.query(`SELECT c.id,c.reason,c.status,c.decision_reason,c.created_at,c.reviewed_at,
+      b.booking_code,b.customer_name,b.customer_phone,b.booking_date::text AS booking_date,
+      b.time_slot,b.status AS booking_status,b.payment_status,b.amount_vnd,room.name AS room_name
+      FROM booking_cancellation_requests c JOIN bookings b ON b.id=c.booking_id
+      JOIN rooms room ON room.id=b.room_id WHERE ($1='ALL' OR c.status=$1)
+      ORDER BY c.created_at DESC LIMIT 100`,[status]);
+    res.json({requests:r.rows});
+  })
+);
+
+app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requireRole('EMPLOYEE','OWNER'),
+  asyncHandler(async(req,res)=>{
+    const id=Number(req.params.id),decision=req.body?.decision;
+    const reason=String(req.body?.decisionReason||'').trim();
+    if(!Number.isSafeInteger(id)||id<1||!['APPROVE','REJECT'].includes(decision))return res.status(400).json({message:'Yêu cầu hoặc quyết định không hợp lệ.'});
+    if(reason.length>500 || (decision==='REJECT'&&reason.length<5))return res.status(400).json({message:'Lý do từ chối cần 5–500 ký tự.'});
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const actor=await client.query('SELECT id,role,active FROM users WHERE id=$1',[req.user.id]);
+      if(!actor.rowCount||!actor.rows[0].active||!['EMPLOYEE','OWNER'].includes(actor.rows[0].role)){
+        await client.query('ROLLBACK');return res.status(403).json({message:'Tài khoản không có quyền xét duyệt.'});
+      }
+      const peek=await client.query(`SELECT b.room_id FROM booking_cancellation_requests c JOIN bookings b ON b.id=c.booking_id WHERE c.id=$1`,[id]);
+      if(!peek.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy yêu cầu.'});}
+      // Same room -> booking lock ordering as creation / reschedule approval.
+      await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE',[peek.rows[0].room_id]);
+      const found=await client.query(`SELECT c.id,c.status AS request_status,c.booking_id,b.status AS booking_status,
+        b.payment_status,b.booking_code,b.amount_vnd FROM booking_cancellation_requests c
+        JOIN bookings b ON b.id=c.booking_id WHERE c.id=$1 FOR UPDATE OF c,b`,[id]);
+      if(!found.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy yêu cầu.'});}
+      const r=found.rows[0];
+      if(r.request_status!=='PENDING'){await client.query('ROLLBACK');return res.status(409).json({message:'Yêu cầu đã được xử lý.'});}
+      if(decision==='APPROVE'){
+        if(r.booking_status!=='CONFIRMED'||r.payment_status!=='PAID'){
+          await client.query('ROLLBACK');return res.status(409).json({message:'Đơn đã thay đổi trạng thái; không thể duyệt.'});
+        }
+        const current=await client.query(`SELECT 1 FROM refunds WHERE booking_id=$1 AND status IN ('PENDING_APPROVAL','APPROVED','COMPLETED')`,[r.booking_id]);
+        if(current.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đơn đã có quy trình hoàn tiền; cần kiểm tra thủ công.'});}
+        await client.query(`UPDATE bookings SET status='CANCELLED',updated_at=NOW() WHERE id=$1`,[r.booking_id]);
+        // Không giả lập chuyển tiền. Tạo yêu cầu hoàn tiền cho chủ quán quyết định.
+        await client.query(`INSERT INTO refunds(booking_id,requested_by,reason,amount_vnd)
+          VALUES($1,$2,$3,$4)`,[r.booking_id,req.user.id,'Khách yêu cầu hủy đặt phòng: '+r.booking_code,r.amount_vnd]);
+        await client.query(`UPDATE email_notifications SET status='SKIPPED' WHERE booking_id=$1 AND kind='REMINDER' AND status IN ('PENDING','FAILED')`,[r.booking_id]);
+        await client.query(`UPDATE sms_reminders SET status='SKIPPED' WHERE booking_id=$1 AND status IN ('PENDING','FAILED')`,[r.booking_id]);
+      }
+      await client.query(`UPDATE booking_cancellation_requests SET status=$1,reviewed_by=$2,
+        reviewed_at=NOW(),decision_reason=$3 WHERE id=$4`,[decision==='APPROVE'?'APPROVED':'REJECTED',req.user.id,reason||null,id]);
+      await writeAudit(client,req.user.id,decision==='APPROVE'?'APPROVE_CANCELLATION':'REJECT_CANCELLATION',
+        'CANCELLATION_REQUEST',id,{bookingCode:r.booking_code,decisionReason:reason});
+      await client.query('COMMIT');
+      res.json({message:decision==='APPROVE'?'Đã hủy đơn và tạo yêu cầu hoàn tiền để chủ quán xét duyệt. Chưa chuyển tiền.':'Đã từ chối yêu cầu; đơn vẫn giữ nguyên.'});
+    } catch(error){await client.query('ROLLBACK');throw error;} finally{client.release();}
+  })
+);
+
 // COMMIT 03: Customer submits a request for approval; this endpoint NEVER changes the booked slot.
 app.post('/api/bookings/:code/reschedule-requests',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false }),
@@ -230,6 +346,10 @@ app.post('/api/bookings/:code/reschedule-requests',
       if (!isBookableAt(newDate, newTimeSlot)) {
         await client.query('ROLLBACK');
         return res.status(400).json({ message: 'Khung giờ mới không còn đủ thời gian đặt trước.' });
+      }
+      const cancellationPending = await client.query(`SELECT id FROM booking_cancellation_requests WHERE booking_id=$1 AND status='PENDING'`, [booking.id]);
+      if (cancellationPending.rowCount) {
+        await client.query('ROLLBACK'); return res.status(409).json({message:'Đơn đang chờ duyệt hủy; không thể đổi lịch.'});
       }
       const pending = await client.query(`SELECT id FROM booking_reschedule_requests
         WHERE booking_id=$1 AND status='PENDING' LIMIT 1`, [booking.id]);
@@ -342,6 +462,8 @@ app.patch('/api/management/reschedule-requests/:id/decision',
         await client.query('ROLLBACK'); return res.status(409).json({ message: 'Lịch đặt phòng đã thay đổi hoặc không còn đủ điều kiện để xét duyệt.' });
       }
       if (decision === 'APPROVE') {
+        const cancelledRequest = await client.query(`SELECT 1 FROM booking_cancellation_requests WHERE booking_id=$1 AND status='PENDING'`,[r.booking_id]);
+        if (cancelledRequest.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({message:'Đơn đang chờ xử lý hủy; không thể duyệt đổi lịch.'}); }
         if (!canApproveReschedule(r.new_booking_date,r.new_time_slot,TIME_SLOTS)) {
           await client.query('ROLLBACK'); return res.status(409).json({ message: 'Khung giờ đề xuất đã quá gần hoặc không còn hợp lệ. Vui lòng từ chối để khách chọn giờ khác.' });
         }
@@ -438,7 +560,23 @@ app.post('/api/payments/bookings/:code/create', rateLimit({windowMs:15*60*1000,l
     if(existing.rowCount) {
       await client.query('COMMIT');
       const x=existing.rows[0];
-      return res.json({qrContent:x.qr_code,checkoutUrl:x.checkout_url,orderCode:Number(x.order_code)});
+      // A previous attempt can reserve an orderCode before payOS returns a QR.
+      // Never return an empty QR or create a second payOS order blindly.
+      if (x.qr_code || x.checkout_url)
+        return res.json({qrContent:x.qr_code||'',checkoutUrl:x.checkout_url||'',orderCode:Number(x.order_code)});
+      try {
+        const remote=await payos.paymentRequests.get(Number(x.order_code));
+        if(remote?.qrCode || remote?.checkoutUrl) {
+          await pool.query(`UPDATE payos_payment_requests SET qr_code=$2,checkout_url=$3,updated_at=NOW()
+            WHERE order_code=$1`,[x.order_code,remote.qrCode||'',remote.checkoutUrl||'']);
+          return res.json({qrContent:remote.qrCode||'',checkoutUrl:remote.checkoutUrl||'',orderCode:Number(x.order_code)});
+        }
+      } catch(err) {
+        console.warn('payOS QR recovery not available:',err.message);
+      }
+      return res.status(503).json({
+        message:'payOS chưa cung cấp mã QR cho giao dịch này. Vui lòng kiểm tra cấu hình hoặc liên hệ quán; không chuyển tiền khi chưa có QR hợp lệ.'
+      });
     }
     // Insert first to reserve a unique orderCode, then call payOS outside the transaction.
     const created=await client.query(`INSERT INTO payos_payment_requests(booking_id)

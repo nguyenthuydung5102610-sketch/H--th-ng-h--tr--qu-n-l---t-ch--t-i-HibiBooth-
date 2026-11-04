@@ -1,5 +1,5 @@
 import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { Camera, CalendarDays, Search, ShieldCheck, LogOut, LayoutDashboard, ClipboardList, ScanLine, Wallet, Users, ScrollText } from 'lucide-react';
+import { Camera, CalendarDays, Search, ShieldCheck, LogOut, LayoutDashboard, ClipboardList, ScanLine, Wallet, Users, ScrollText, CalendarClock, CalendarX2 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
 export function CustomerLayout() {
@@ -19,11 +19,15 @@ export function AdminLayout({ owner = false }: { owner?: boolean }) {
     { to: '/nhan-vien', label: 'Tổng quan', icon: LayoutDashboard, end: true },
     { to: '/nhan-vien/don-dat', label: 'Quản lý đơn', icon: ClipboardList },
     { to: '/nhan-vien/check-in', label: 'Quét QR check-in', icon: ScanLine },
+    { to: '/nhan-vien/doi-lich', label: 'Duyệt đổi lịch', icon: CalendarClock },
+    { to: '/nhan-vien/huy-lich', label: 'Duyệt hủy đơn', icon: CalendarX2 },
     { to: '/nhan-vien/hoan-tien', label: 'Yêu cầu hoàn tiền', icon: Wallet },
   ];
   const ownerLinks = [
     { to: '/chu-quan', label: 'Tổng quan', icon: LayoutDashboard, end: true },
     { to: '/chu-quan/nhan-vien', label: 'Quản lý nhân viên', icon: Users },
+    { to: '/chu-quan/doi-lich', label: 'Duyệt đổi lịch', icon: CalendarClock },
+    { to: '/chu-quan/huy-lich', label: 'Duyệt hủy đơn', icon: CalendarX2 },
     { to: '/chu-quan/hoan-tien', label: 'Duyệt hoàn tiền', icon: Wallet },
     { to: '/chu-quan/nhat-ky', label: 'Nhật ký hệ thống', icon: ScrollText },
     { to: '/chu-quan/don-dat',label: 'Danh sách đặt phòng',icon: ClipboardList},

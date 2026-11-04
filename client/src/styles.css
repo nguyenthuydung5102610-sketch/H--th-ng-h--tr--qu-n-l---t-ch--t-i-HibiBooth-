@@ -102,3 +102,9 @@ body,button,input,select,textarea{font-family:'Be Vietnam Pro',Arial,sans-serif}
 .calendar-button:hover{background:#d9eadd;color:#11372b}
 .email-reminder-notice{display:flex;align-items:flex-start;gap:10px;background:#f3f7f0;border:1px solid #d9e8d9;border-radius:13px;color:#476052;padding:13px 14px;font-size:.78rem;line-height:1.7;margin:12px 0 16px}
 .email-reminder-notice svg{flex-shrink:0;margin-top:2px;color:#216e52}
+
+/* COMMIT 06 payment UX: a neutral, short loading state; no decorative blue/green notices. */
+.qr-loading,.qr-unavailable{display:flex;justify-content:center;align-items:center;
+  width:min(100%,295px);min-height:105px;margin:4px auto 16px;text-align:center;
+  border:1px dashed var(--line);border-radius:15px;background:#fffdf8;
+  color:var(--muted);font-size:.9rem;padding:20px;line-height:1.5}

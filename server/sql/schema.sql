@@ -194,3 +194,21 @@ CREATE TABLE IF NOT EXISTS reschedule_decision_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_reschedule_decision_notifications_due
   ON reschedule_decision_notifications(status, due_at);
+
+
+-- COMMIT 06: yêu cầu hủy đơn đã thanh toán (chờ nhân viên/chủ quán xét duyệt).
+CREATE TABLE IF NOT EXISTS booking_cancellation_requests (
+  id BIGSERIAL PRIMARY KEY,
+  booking_id BIGINT NOT NULL REFERENCES bookings(id),
+  reason VARCHAR(500) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+    CHECK (status IN ('PENDING','APPROVED','REJECTED')),
+  reviewed_by INTEGER REFERENCES users(id),
+  decision_reason VARCHAR(500),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reviewed_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_booking_cancel_pending
+  ON booking_cancellation_requests(booking_id) WHERE status='PENDING';
+CREATE INDEX IF NOT EXISTS idx_booking_cancel_status
+  ON booking_cancellation_requests(status,created_at DESC);
