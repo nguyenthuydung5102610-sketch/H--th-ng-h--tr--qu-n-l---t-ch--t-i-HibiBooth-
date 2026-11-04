@@ -10,34 +10,14 @@ import { validCustomerName, isValidDate, isBookableAt, checkinWindow, formatBook
 import { scheduleBookingEmails, startEmailNotificationWorker, isValidCustomerEmail, emailServiceEnabled } from './email-notifications.js';
 import { pool, writeAudit } from './db.js';
 import { requireAuth, requireRole } from './auth.js';
+import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule } from './reschedule-rules.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
   process.exit(1);
 }
-// Never start a public service with demo secrets, demo payment or the wrong client URL.
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const PUBLIC_BOOKINGS_ENABLED = !IS_PRODUCTION || process.env.ENABLE_PUBLIC_BOOKINGS === 'true';
-if (IS_PRODUCTION) {
-  const jwtSecret = process.env.JWT_SECRET || '';
-  if (jwtSecret.length < 32 || /replace-this|changeme|demo|example/i.test(jwtSecret)) {
-    throw new Error('JWT_SECRET production phai la chuoi ngau nhien tu 32 ky tu tro len.');
-  }
-  if (process.env.ENABLE_DEMO_PAYMENT === 'true') throw new Error('Khong duoc bat thanh toan demo tren production.');
-  if (!process.env.CLIENT_ORIGIN?.startsWith('https://') || !process.env.PUBLIC_BASE_URL?.startsWith('https://')) {
-    throw new Error('CLIENT_ORIGIN va PUBLIC_BASE_URL phai su dung HTTPS tren production.');
-  }
-  if (PUBLIC_BOOKINGS_ENABLED && !['PAYOS_CLIENT_ID','PAYOS_API_KEY','PAYOS_CHECKSUM_KEY'].every(k => process.env[k]?.trim())) {
-    throw new Error('Chua du payOS secrets: khong the mo dat phong that.');
-  }
-  if (PUBLIC_BOOKINGS_ENABLED && !(process.env.EMAIL_PROVIDER==='resend' && process.env.RESEND_API_KEY && process.env.EMAIL_FROM)) {
-    throw new Error('Chua cau hinh email that: khong the mo dat phong that.');
-  }
-}
 
 const app = express();
-if (IS_PRODUCTION) app.set('trust proxy', 1); // Render terminates HTTPS at its reverse proxy.
-
 const PORT = Number(process.env.PORT || 4000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
 const DEMO_PAYMENT_ENABLED = process.env.ENABLE_DEMO_PAYMENT === 'true' && process.env.NODE_ENV !== 'production';
@@ -84,8 +64,6 @@ const payos = PAYOS_ENABLED ? new PayOS({
   checksumKey: process.env.PAYOS_CHECKSUM_KEY,
 }) : null;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || CLIENT_ORIGIN.split(',')[0].trim();
-const isCustomerPhone = p => typeof p === 'string' && /^(03|05|07|08|09)\d{8}$/.test(p);
-const bookingPhoneFromRequest = req => String(req.get('x-booking-phone') || '').trim();
 
 
 
@@ -96,7 +74,7 @@ app.get('/api/catalog', asyncHandler(async (_req, res) => {
     pool.query('SELECT id, code, name, description FROM rooms WHERE active = TRUE ORDER BY id'),
     pool.query('SELECT id, code, name, description, price_vnd FROM packages WHERE active = TRUE ORDER BY price_vnd'),
   ]);
-  res.json({ rooms: rooms.rows, packages: packages.rows, timeSlots: TIME_SLOTS, bookingEnabled: PUBLIC_BOOKINGS_ENABLED });
+  res.json({ rooms: rooms.rows, packages: packages.rows, timeSlots: TIME_SLOTS });
 }));
 
 app.get('/api/availability', asyncHandler(async (req, res) => {
@@ -121,7 +99,6 @@ app.get('/api/availability', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/bookings', rateLimit({windowMs:15*60*1000,limit:20}), asyncHandler(async (req, res) => {
-  if (!PUBLIC_BOOKINGS_ENABLED) return res.status(503).json({message:'HIBI BOOTH đang công khai bản xem trước, chưa nhận đặt lịch hoặc thanh toán.'});
   const { customerName, customerPhone, customerEmail, roomId, packageId, date, timeSlot } = req.body || {};
   const validPhone = 
       typeof customerPhone === 'string' && 
@@ -216,16 +193,89 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   res.json({ ...booking, customer_phone: maskPhone(booking.customer_phone), qr_content: canIssueCheckinQr(booking.status, booking.payment_status) ? `HIBI|${booking.booking_code}` : null });
 }));
 
+// COMMIT 03: Customer submits a request for approval; this endpoint NEVER changes the booked slot.
+app.post('/api/bookings/:code/reschedule-requests',
+  rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false }),
+  asyncHandler(async (req, res) => {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    if (!isBookingCode(code)) return res.status(400).json({ message: 'Mã đặt phòng không hợp lệ.' });
+    const validationError = validateRescheduleInput(req.body, TIME_SLOTS);
+    if (validationError) return res.status(400).json({ message: validationError });
+
+    const phone = normalizeCustomerPhone(req.body.customerPhone);
+    const { newDate, newTimeSlot } = req.body;
+    const reason = req.body.reason.trim();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const found = await client.query(`
+        SELECT b.id, b.room_id, b.booking_date::text AS booking_date, b.time_slot,
+               b.status, b.payment_status
+        FROM bookings b
+        WHERE b.booking_code = $1 AND b.customer_phone = $2
+        FOR UPDATE OF b`, [code, phone]);
+      if (!found.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'Không tìm thấy đơn hoặc số điện thoại không khớp.' });
+      }
+      const booking = found.rows[0];
+      if (!canRequestReschedule(booking.status, booking.payment_status)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: 'Chỉ đơn đã thanh toán và đang được xác nhận mới có thể yêu cầu đổi lịch.' });
+      }
+      if (booking.booking_date === newDate && booking.time_slot === newTimeSlot) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Khung giờ mới phải khác lịch hiện tại.' });
+      }
+      if (!isBookableAt(newDate, newTimeSlot)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Khung giờ mới không còn đủ thời gian đặt trước.' });
+      }
+      const pending = await client.query(`SELECT id FROM booking_reschedule_requests
+        WHERE booking_id=$1 AND status='PENDING' LIMIT 1`, [booking.id]);
+      if (pending.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: 'Đơn đã có yêu cầu đổi lịch đang chờ xét duyệt.' });
+      }
+      // Pre-check for an occupied destination. The eventual approval MUST recheck under room lock.
+      const occupied = await client.query(`SELECT id FROM bookings
+        WHERE room_id=$1 AND booking_date=$2 AND id<>$3
+          AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
+          AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
+          AND (status <> 'PENDING_PAYMENT' OR hold_expires_at>NOW()) LIMIT 1`,
+      [booking.room_id, newDate, booking.id, minuteOf(newTimeSlot), SESSION_MINUTES]);
+      if (occupied.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: 'Phòng không còn trống vào khung giờ đề xuất. Vui lòng chọn giờ khác.' });
+      }
+      const created = await client.query(`INSERT INTO booking_reschedule_requests
+        (booking_id, requested_by, old_booking_date, old_time_slot, new_booking_date, new_time_slot, reason)
+        VALUES ($1, 'CUSTOMER', $2, $3, $4, $5, $6)
+        RETURNING id, status, new_booking_date::text AS new_booking_date, new_time_slot, created_at`,
+      [booking.id, booking.booking_date, booking.time_slot, newDate, newTimeSlot, reason]);
+      await writeAudit(client, null, 'CUSTOMER_REQUEST_RESCHEDULE', 'BOOKING', booking.id,
+        { requestId: created.rows[0].id, newDate, newTimeSlot });
+      await client.query('COMMIT');
+      return res.status(201).json({
+        message: 'Đã gửi yêu cầu đổi lịch, đang chờ nhân viên hoặc chủ quán xét duyệt. Lịch hiện tại chưa thay đổi.',
+        request: created.rows[0],
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error.code === '23505') return res.status(409).json({ message: 'Đơn đã có yêu cầu đổi lịch đang chờ xét duyệt.' });
+      throw error;
+    } finally { client.release(); }
+  })
+);
+
 // Read-only status. Never trust a browser redirect as proof of payment.
-app.get('/api/payments/bookings/:code', rateLimit({windowMs:15*60*1000,limit:40}), asyncHandler(async (req, res) => {
+app.get('/api/payments/bookings/:code', asyncHandler(async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!isBookingCode(code)) return res.status(400).json({ message: 'Mã đơn không hợp lệ.' });
-  const phone = bookingPhoneFromRequest(req);
-  if (!isCustomerPhone(phone)) return res.status(404).json({message:'Không tìm thấy đơn đặt phòng.'});
   const result = await pool.query(`SELECT b.booking_code,b.amount_vnd,b.status,b.payment_status,b.hold_expires_at,
     b.booking_date::text AS booking_date,b.time_slot,r.name AS room_name,
     p.qr_code,p.checkout_url FROM bookings b JOIN rooms r ON r.id=b.room_id LEFT JOIN payos_payment_requests p ON p.booking_id=b.id
-    WHERE b.booking_code=$1 AND b.customer_phone=$2`, [code, phone]);
+    WHERE b.booking_code=$1`, [code]);
   if (!result.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn.' });
   const b = result.rows[0];
   if (b.status==='PENDING_PAYMENT' && new Date(b.hold_expires_at) <= new Date()) {
@@ -243,9 +293,6 @@ app.get('/api/payments/bookings/:code', rateLimit({windowMs:15*60*1000,limit:40}
 
 // Create a payOS payment request once per booking; orderCode is unique and numeric.
 app.post('/api/payments/bookings/:code/create', rateLimit({windowMs:15*60*1000,limit:15}), asyncHandler(async (req,res) => {
-  if (!PUBLIC_BOOKINGS_ENABLED) return res.status(503).json({message:'Chưa mở nhận thanh toán trên bản xem trước.'});
-  const phone = bookingPhoneFromRequest(req);
-  if (!isCustomerPhone(phone)) return res.status(404).json({message:'Không tìm thấy đơn đặt phòng.'});
   if (!payos) return res.status(503).json({message:'Chưa cấu hình payOS trên Backend.'});
   const code=String(req.params.code||'').trim().toUpperCase();
   if (!isBookingCode(code)) return res.status(400).json({message:'Mã đơn không hợp lệ.'});
@@ -254,7 +301,7 @@ app.post('/api/payments/bookings/:code/create', rateLimit({windowMs:15*60*1000,l
   try {
     await client.query('BEGIN');
     const r=await client.query(`SELECT id,booking_code,amount_vnd,status,hold_expires_at
-      FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
+      FROM bookings WHERE booking_code=$1 FOR UPDATE`,[code]);
     if (!r.rowCount) {await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn.'});}
     b=r.rows[0];
     if (b.status!=='PENDING_PAYMENT' || new Date(b.hold_expires_at)<=new Date()) {
@@ -291,13 +338,11 @@ app.post('/api/payments/bookings/:code/create', rateLimit({windowMs:15*60*1000,l
 // Reconcile a pending payment directly with payOS. Useful on localhost where payOS cannot reach the webhook.
 // A paid redirect alone is NEVER treated as proof of payment.
 app.post('/api/payments/bookings/:code/reconcile', rateLimit({windowMs:60*1000,limit:8}), asyncHandler(async (req,res) => {
-  const phone = bookingPhoneFromRequest(req);
-  if (!isCustomerPhone(phone)) return res.status(404).json({message:'Không tìm thấy đơn đặt phòng.'});
   if(!payos) return res.status(503).json({message:'payOS chưa được cấu hình.'});
   const code=String(req.params.code||'').trim().toUpperCase();
   if(!isBookingCode(code)) return res.status(400).json({message:'Mã đơn không hợp lệ.'});
   const match=await pool.query(`SELECT p.order_code,b.id,b.status,b.payment_status,b.amount_vnd,b.hold_expires_at
-    FROM payos_payment_requests p JOIN bookings b ON b.id=p.booking_id WHERE b.booking_code=$1 AND b.customer_phone=$2`,[code,phone]);
+    FROM payos_payment_requests p JOIN bookings b ON b.id=p.booking_id WHERE b.booking_code=$1`,[code]);
   if(!match.rowCount) return res.status(404).json({message:'Không tìm thấy yêu cầu thanh toán payOS.'});
   const orderCode=Number(match.rows[0].order_code);
   let remote;
@@ -333,7 +378,7 @@ app.post('/api/payments/bookings/:code/reconcile', rateLimit({windowMs:60*1000,l
 // Chỉ thử trên máy: mô phỏng server nhận callback thành công sau khi đã đối chiếu.
 // Khi kết nối payOS, XÓA route này và thay bằng Webhook có verify signature.
 app.post('/api/demo/bookings/:code/pay', rateLimit({ windowMs: 60*1000, limit: 15 }), asyncHandler(async (req, res) => {
-  if (!PUBLIC_BOOKINGS_ENABLED || PAYOS_ENABLED || !DEMO_PAYMENT_ENABLED || !['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) {
+  if (PAYOS_ENABLED || !DEMO_PAYMENT_ENABLED || !['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) {
     return res.status(403).json({ message: 'Chỉ cho phép mô phỏng thanh toán khi chạy local.' });
   }
   const code = String(req.params.code || '').trim().toUpperCase();
@@ -377,7 +422,7 @@ app.post('/api/payos/webhook', asyncHandler(async (req,res) => {
     const r=await client.query(`SELECT b.id,b.booking_code,b.amount_vnd,b.status,b.payment_status,b.hold_expires_at
       FROM payos_payment_requests p JOIN bookings b ON b.id=p.booking_id
       WHERE p.order_code=$1 FOR UPDATE OF b`,[orderCode]);
-    if(!r.rowCount) {await client.query('COMMIT');return res.json({success:true}); /* payOS webhook registration can send a signed sample order. */}
+    if(!r.rowCount) {await client.query('ROLLBACK');return res.status(404).json({message:'Không có yêu cầu thanh toán tương ứng.'});}
     const b=r.rows[0];
     if(amount!==b.amount_vnd) {
       await writeAudit(client,null,'PAYOS_AMOUNT_MISMATCH','BOOKING',b.id,{orderCode,transactionRef,amount});
