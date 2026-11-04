@@ -278,15 +278,25 @@ export function LookupPage() {
     setCancellations(data.requests);
   }
   async function sendCancellation(event:FormEvent) {
-    event.preventDefault();setError('');setMessage('');setLoading(true);
+    event.preventDefault();
+    if (loading || cancelReason.trim().length < 5 || cancelReason.trim().length > 500) return;
+    const label=booking?.payment_status==='PAID'
+      ? 'Gửi yêu cầu hủy để nhân viên/chủ quán xét duyệt? Chưa thực hiện hoàn tiền.'
+      : 'Hủy ngay chỗ giữ chưa thanh toán? Thao tác này không thể khôi phục.';
+    if (!window.confirm(label)) return;
+    setError('');setMessage('');setLoading(true);
     try {
-      if(!window.confirm('Bạn chắc chắn muốn gửi yêu cầu hủy đặt phòng?')) return;
       const result=await post<{message:string;status:string}>(`/bookings/${encodeURIComponent(bookingCode)}/cancellation`,
         {customerPhone:phone,reason:cancelReason.trim()});
+      // API has accepted the request; a subsequent lookup failure must not suggest resubmitting it.
       setMessage(result.message);setCancelReason('');
-      await reloadCancellation();
-      const current=await api<LookupBooking>(`/bookings/lookup/${encodeURIComponent(bookingCode)}?phone=${encodeURIComponent(phone)}`);
-      setBooking(current);
+      try {
+        await reloadCancellation();
+        const current=await api<LookupBooking>(`/bookings/lookup/${encodeURIComponent(bookingCode)}?phone=${encodeURIComponent(phone)}`);
+        setBooking(current);
+      } catch {
+        setError('Yêu cầu đã được ghi nhận nhưng chưa tải lại được trạng thái. Vui lòng tra cứu lại, KHÔNG gửi yêu cầu lần nữa.');
+      }
     }catch(e){setError(e instanceof Error?e.message:'Không gửi được yêu cầu hủy.');}
     finally{setLoading(false);}
   }
@@ -374,7 +384,7 @@ export function LookupPage() {
           <form onSubmit={sendCancellation} className="reschedule-form">
             <p>{booking.payment_status==='PAID'?'Đơn đã thanh toán cần nhân viên/chủ quán duyệt hủy. Hoàn tiền cần chủ quán duyệt riêng; không tự động chuyển tiền.':'Đơn chưa thanh toán sẽ được hủy ngay và giải phóng chỗ giữ tạm.'}</p>
             <label>Lý do hủy<input value={cancelReason} onChange={e=>setCancelReason(e.target.value)} minLength={5} maxLength={500} required placeholder="Vui lòng nhập lý do hủy"/></label>
-            <button className="button light full" disabled={loading||cancelReason.trim().length<5}>Gửi yêu cầu hủy đặt phòng</button>
+            <button className="button light full" disabled={loading||cancelReason.trim().length<5||cancelReason.trim().length>500}>{loading?'Đang gửi yêu cầu...':'Gửi yêu cầu hủy đặt phòng'}</button>
           </form>}
 
       </div>}
