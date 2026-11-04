@@ -21,3 +21,19 @@ export function validateRescheduleInput(input, validSlots, nowMs = Date.now()) {
 export function canRequestReschedule(status, paymentStatus) {
   return status === 'CONFIRMED' && paymentStatus === 'PAID';
 }
+
+// Approval is a distinct XOR decision after the customer submits the request.
+export function validateRescheduleDecision(input) {
+  if (!input || !['APPROVE','REJECT'].includes(input.decision)) return 'Quyết định phải là APPROVE hoặc REJECT.';
+  if (input.decisionReason != null && (typeof input.decisionReason !== 'string' || input.decisionReason.length > 500)) {
+    return 'Lý do xét duyệt không hợp lệ (tối đa 500 ký tự).';
+  }
+  if (input.decision === 'REJECT' && (typeof input.decisionReason !== 'string' || input.decisionReason.trim().length < 5)) {
+    return 'Khi từ chối cần nhập lý do ít nhất 5 ký tự.';
+  }
+  return null;
+}
+
+export function canApproveReschedule(date, slot, validSlots, nowMs = Date.now()) {
+  return Array.isArray(validSlots) && validSlots.includes(slot) && isBookableAt(date, slot, nowMs);
+}

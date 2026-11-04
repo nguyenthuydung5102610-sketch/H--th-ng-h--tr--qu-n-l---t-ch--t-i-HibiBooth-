@@ -174,3 +174,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_reschedule_one_pending_per_booking
   WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_reschedule_requests_status_created
   ON booking_reschedule_requests (status, created_at DESC);
+
+
+-- COMMIT 04: Outbox for approval/rejection notices, one message per request.
+-- Does not assert that an email has been delivered.
+CREATE TABLE IF NOT EXISTS reschedule_decision_notifications (
+  id BIGSERIAL PRIMARY KEY,
+  request_id BIGINT UNIQUE NOT NULL REFERENCES booking_reschedule_requests(id),
+  recipient_email VARCHAR(254) NOT NULL,
+  due_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  status VARCHAR(16) NOT NULL DEFAULT 'PENDING'
+    CHECK (status IN ('PENDING','SENDING','SUBMITTED','FAILED','SKIPPED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  claimed_at TIMESTAMPTZ,
+  sent_at TIMESTAMPTZ,
+  provider_message_id VARCHAR(120),
+  error_message VARCHAR(240),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_reschedule_decision_notifications_due
+  ON reschedule_decision_notifications(status, due_at);

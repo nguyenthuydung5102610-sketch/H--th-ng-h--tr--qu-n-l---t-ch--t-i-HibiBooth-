@@ -120,7 +120,7 @@ export async function processEmailNotifications(pool) {
     const {subject,text}=emailMessage(job.kind,job);
     try {
       const emailId=await sendThroughResend({
-        to:job.recipient_email,subject,text,idempotencyKey:`hibi-${job.kind.toLowerCase()}-${job.booking_id}`,
+        to:job.recipient_email,subject,text,idempotencyKey:job.kind==='REMINDER' ? `hibi-reminder-${job.booking_id}-${job.booking_date}-${job.time_slot}` : `hibi-confirmation-${job.booking_id}`,
       });
       await pool.query(`UPDATE email_notifications SET status='SUBMITTED',sent_at=NOW(),provider_message_id=$2,error_message=NULL WHERE id=$1`,[job.id,emailId]);
     } catch (error) {
@@ -136,6 +136,70 @@ export async function processEmailNotifications(pool) {
   return {processed,provider:EMAIL_PROVIDER};
 }
 
+// Reschedule decisions are separate jobs: repeated schedule changes must each notify the customer.
+export function rescheduleDecisionEmailMessage(job) {
+  const [year,month,day] = String(job.new_booking_date).split('-');
+  const [oldYear,oldMonth,oldDay] = String(job.old_booking_date).split('-');
+  const revised = `${job.new_time_slot} ngày ${day}/${month}/${year}`;
+  const original = `${job.old_time_slot} ngày ${oldDay}/${oldMonth}/${oldYear}`;
+  const approved = job.decision_status==='APPROVED';
+  return {
+    subject:`HIBI BOOTH - ${approved?'Đổi lịch đã được duyệt':'Yêu cầu đổi lịch bị từ chối'} - ${job.booking_code}`,
+    text: approved
+      ? `Xin chào ${job.customer_name},\n\nYêu cầu đổi lịch ${job.booking_code} đã được duyệt.\nLịch cũ: ${original}.\nLịch mới: ${revised}.\nPhòng: ${job.room_name}.\n\nNếu bạn đã lưu lịch trên Google Calendar, vui lòng cập nhật sự kiện cũ.\nTạo sự kiện mới: ${googleCalendarUrl({bookingDate:job.new_booking_date,timeSlot:job.new_time_slot,bookingCode:job.booking_code,roomName:job.room_name})}\n\nHIBI BOOTH`
+      : `Xin chào ${job.customer_name},\n\nYêu cầu đổi lịch ${job.booking_code} không được phê duyệt.\nLý do: ${job.decision_reason || 'Không được chấp thuận'}.\nLịch ban đầu vẫn giữ nguyên: ${original}.\nBạn có thể tra cứu đơn để xem kết quả.\n\nHIBI BOOTH`,
+  };
+}
+
+export async function processRescheduleDecisionNotifications(pool) {
+  if (!emailServiceEnabled()) return {processed:0, provider:'disabled'};
+  let processed=0;
+  for(let i=0;i<10;i++){
+    const client=await pool.connect();
+    let job;
+    try {
+      await client.query('BEGIN');
+      const result=await client.query(`SELECT n.id,n.request_id,n.attempts,n.recipient_email,
+        r.status AS decision_status,r.decision_reason,r.old_booking_date::text AS old_booking_date,
+        r.old_time_slot,r.new_booking_date::text AS new_booking_date,r.new_time_slot,
+        b.booking_code,b.customer_name,room.name AS room_name
+        FROM reschedule_decision_notifications n
+        JOIN booking_reschedule_requests r ON r.id=n.request_id
+        JOIN bookings b ON b.id=r.booking_id JOIN rooms room ON room.id=b.room_id
+        WHERE (n.status='PENDING' AND n.due_at<=NOW()) OR
+          (n.status='SENDING' AND n.claimed_at < NOW()-INTERVAL '5 minutes')
+        ORDER BY n.due_at,n.id LIMIT 1 FOR UPDATE OF n SKIP LOCKED`);
+      if (!result.rowCount) {await client.query('COMMIT');break;}
+      job=result.rows[0];
+      await client.query(`UPDATE reschedule_decision_notifications
+        SET status='SENDING', attempts=attempts+1,claimed_at=NOW() WHERE id=$1`,[job.id]);
+      await client.query('COMMIT');
+    } catch(error){await client.query('ROLLBACK');throw error;}
+    finally {client.release();}
+    processed++;
+    if (!['APPROVED','REJECTED'].includes(job.decision_status) || !isValidCustomerEmail(job.recipient_email)) {
+      await pool.query("UPDATE reschedule_decision_notifications SET status='SKIPPED' WHERE id=$1",[job.id]);
+      continue;
+    }
+    const {subject,text}=rescheduleDecisionEmailMessage(job);
+    try {
+      const emailId=await sendThroughResend({to:job.recipient_email,subject,text,
+        idempotencyKey:`hibi-reschedule-decision-${job.request_id}`});
+      await pool.query(`UPDATE reschedule_decision_notifications SET
+        status='SUBMITTED',sent_at=NOW(),provider_message_id=$2,error_message=NULL WHERE id=$1`,[job.id,emailId]);
+    } catch(error) {
+      const attempts=Number(job.attempts)+1;
+      const retry=attempts<5;
+      await pool.query(`UPDATE reschedule_decision_notifications SET status=$2,
+        due_at=CASE WHEN $3 THEN NOW()+$4::interval ELSE due_at END,
+        error_message=$5 WHERE id=$1`,
+        [job.id,retry?'PENDING':'FAILED',retry,`${Math.min(attempts*2,10)} minutes`,String(error.message||error).slice(0,220)]);
+      console.warn(`Thông báo đổi lịch HIBI thất bại, công việc ${job.id}, lần ${attempts}.`);
+    }
+  }
+  return {processed,provider:EMAIL_PROVIDER};
+}
+
 export function startEmailNotificationWorker(pool) {
   if (!emailServiceEnabled()) {
     console.log('Email chưa kích hoạt: đặt EMAIL_PROVIDER=resend, RESEND_API_KEY và EMAIL_FROM trong server/.env.');
@@ -145,7 +209,7 @@ export function startEmailNotificationWorker(pool) {
   const tick=async () => {
     if (running) return;
     running=true;
-    try {await processEmailNotifications(pool);}
+    try {await processEmailNotifications(pool);await processRescheduleDecisionNotifications(pool);}
     catch (error) {console.warn('Email worker gặp lỗi:',error.message);}
     finally {running=false;}
   };

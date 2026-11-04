@@ -10,7 +10,7 @@ import { validCustomerName, isValidDate, isBookableAt, checkinWindow, formatBook
 import { scheduleBookingEmails, startEmailNotificationWorker, isValidCustomerEmail, emailServiceEnabled } from './email-notifications.js';
 import { pool, writeAudit } from './db.js';
 import { requireAuth, requireRole } from './auth.js';
-import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule } from './reschedule-rules.js';
+import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, validateRescheduleDecision, canApproveReschedule } from './reschedule-rules.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -264,6 +264,133 @@ app.post('/api/bookings/:code/reschedule-requests',
       await client.query('ROLLBACK');
       if (error.code === '23505') return res.status(409).json({ message: 'Đơn đã có yêu cầu đổi lịch đang chờ xét duyệt.' });
       throw error;
+    } finally { client.release(); }
+  })
+);
+
+// COMMIT 04: Customer can view the real approval result; never reveal other customers' requests.
+app.get('/api/bookings/:code/reschedule-requests',
+  rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }),
+  asyncHandler(async (req, res) => {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    const phone = normalizeCustomerPhone(req.query.phone);
+    if (!isBookingCode(code) || !phone) return res.status(400).json({ message: 'Vui lòng nhập mã đặt phòng và số điện thoại hợp lệ.' });
+    const result = await pool.query(`SELECT r.id,r.status,r.old_booking_date::text AS old_booking_date,
+      r.old_time_slot,r.new_booking_date::text AS new_booking_date,r.new_time_slot,
+      r.reason,r.decision_reason,r.created_at,r.reviewed_at
+      FROM booking_reschedule_requests r JOIN bookings b ON b.id=r.booking_id
+      WHERE b.booking_code=$1 AND b.customer_phone=$2 ORDER BY r.created_at DESC LIMIT 20`, [code, phone]);
+    // Do not confirm whether a guessed booking code exists.
+    const matching = await pool.query('SELECT 1 FROM bookings WHERE booking_code=$1 AND customer_phone=$2', [code, phone]);
+    if (!matching.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn hoặc số điện thoại không khớp.' });
+    res.json({ requests: result.rows });
+  })
+);
+
+// Both employees and owners may review rescheduling; every decision is checked server-side.
+app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYEE','OWNER'),
+  asyncHandler(async (req, res) => {
+    const status = String(req.query.status || 'PENDING').toUpperCase();
+    if (!['PENDING','APPROVED','REJECTED','CANCELLED','ALL'].includes(status)) return res.status(400).json({ message: 'Bộ lọc trạng thái không hợp lệ.' });
+    const result = await pool.query(`SELECT r.id,r.booking_id,r.old_booking_date::text AS old_booking_date,
+      r.old_time_slot,r.new_booking_date::text AS new_booking_date,r.new_time_slot,r.reason,r.status,
+      r.decision_reason,r.created_at,r.reviewed_at,b.booking_code,b.customer_name,b.customer_phone,
+      room.name AS room_name,u.full_name AS reviewer_name
+      FROM booking_reschedule_requests r
+      JOIN bookings b ON b.id=r.booking_id JOIN rooms room ON room.id=b.room_id
+      LEFT JOIN users u ON u.id=r.reviewed_by
+      WHERE ($1='ALL' OR r.status=$1) ORDER BY r.created_at DESC LIMIT 100`, [status]);
+    res.json({ requests: result.rows });
+  })
+);
+
+app.patch('/api/management/reschedule-requests/:id/decision',
+  requireAuth, requireRole('EMPLOYEE','OWNER'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ message: 'Mã yêu cầu đổi lịch không hợp lệ.' });
+    const validationError = validateRescheduleDecision(req.body);
+    if (validationError) return res.status(400).json({ message: validationError });
+    const decision = req.body.decision;
+    const reason = String(req.body.decisionReason || '').trim();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Revalidate account state; a revoked user cannot approve with an old JWT.
+      const actor = await client.query('SELECT id,role,active FROM users WHERE id=$1', [req.user.id]);
+      if (!actor.rowCount || !actor.rows[0].active || !['EMPLOYEE','OWNER'].includes(actor.rows[0].role)) {
+        await client.query('ROLLBACK'); return res.status(403).json({ message: 'Tài khoản không được phép xét duyệt yêu cầu.' });
+      }
+      // Booking creation locks the room first: preserve that order to avoid deadlocks.
+      const peek = await client.query(`SELECT b.room_id FROM booking_reschedule_requests r
+        JOIN bookings b ON b.id=r.booking_id WHERE r.id=$1`, [id]);
+      if (!peek.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Không tìm thấy yêu cầu đổi lịch.' }); }
+      await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE', [peek.rows[0].room_id]);
+      const found = await client.query(`SELECT r.id,r.booking_id,r.status AS request_status,r.old_booking_date::text AS old_booking_date,
+        r.old_time_slot,r.new_booking_date::text AS new_booking_date,r.new_time_slot,
+        b.booking_code,b.booking_date::text AS booking_date,b.time_slot,b.room_id,b.status AS booking_status,
+        b.payment_status,b.customer_email
+        FROM booking_reschedule_requests r JOIN bookings b ON b.id=r.booking_id
+        WHERE r.id=$1 FOR UPDATE OF r,b`, [id]);
+      if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Không tìm thấy yêu cầu đổi lịch.' }); }
+      const r = found.rows[0];
+      if (r.request_status !== 'PENDING') {
+        await client.query('ROLLBACK'); return res.status(409).json({ message: 'Yêu cầu này đã được xử lý trước đó.' });
+      }
+      if (!canRequestReschedule(r.booking_status,r.payment_status) ||
+          r.booking_date !== r.old_booking_date || r.time_slot !== r.old_time_slot) {
+        await client.query('ROLLBACK'); return res.status(409).json({ message: 'Lịch đặt phòng đã thay đổi hoặc không còn đủ điều kiện để xét duyệt.' });
+      }
+      if (decision === 'APPROVE') {
+        if (!canApproveReschedule(r.new_booking_date,r.new_time_slot,TIME_SLOTS)) {
+          await client.query('ROLLBACK'); return res.status(409).json({ message: 'Khung giờ đề xuất đã quá gần hoặc không còn hợp lệ. Vui lòng từ chối để khách chọn giờ khác.' });
+        }
+        await client.query(`UPDATE bookings SET status='EXPIRED',updated_at=NOW()
+          WHERE status='PENDING_PAYMENT' AND hold_expires_at<NOW()`);
+        const occupied = await client.query(`SELECT id FROM bookings
+          WHERE room_id=$1 AND booking_date=$2 AND id<>$3
+            AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
+            AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
+            AND (status <> 'PENDING_PAYMENT' OR hold_expires_at>NOW()) LIMIT 1`,
+          [r.room_id,r.new_booking_date,r.booking_id,minuteOf(r.new_time_slot),SESSION_MINUTES]);
+        if (occupied.rowCount) {
+          await client.query('ROLLBACK'); return res.status(409).json({ message: 'Khung giờ mới vừa có khách đặt. Không thể phê duyệt, vui lòng đề xuất giờ khác hoặc từ chối yêu cầu.' });
+        }
+        await client.query(`UPDATE bookings SET booking_date=$1,time_slot=$2,updated_at=NOW()
+          WHERE id=$3`,[r.new_booking_date,r.new_time_slot,r.booking_id]);
+        await scheduleBookingEmails(client,r.booking_id);
+        // A booking change invalidates an unsent old reminder. Reset it to the new time.
+        await client.query(`UPDATE email_notifications SET
+            due_at=GREATEST(NOW(),(($1::date+$2::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')-INTERVAL '1 hour'),
+            status='PENDING',attempts=0,claimed_at=NULL,sent_at=NULL,provider_message_id=NULL,error_message=NULL
+          WHERE booking_id=$3 AND kind='REMINDER' AND status IN ('PENDING','FAILED','SKIPPED','SUBMITTED')`,
+          [r.new_booking_date,r.new_time_slot,r.booking_id]);
+        await client.query(`UPDATE sms_reminders SET
+          due_at=GREATEST(NOW(),(($1::date+$2::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')-INTERVAL '1 hour'),
+          status='PENDING',attempts=0,claimed_at=NULL,sent_at=NULL,provider_message_id=NULL,error_message=NULL
+          WHERE booking_id=$3 AND status IN ('PENDING','FAILED','SKIPPED','SUBMITTED')`,
+          [r.new_booking_date,r.new_time_slot,r.booking_id]);
+      }
+      const state = decision==='APPROVE'?'APPROVED':'REJECTED';
+      await client.query(`UPDATE booking_reschedule_requests
+        SET status=$1,reviewed_by=$2,reviewed_at=NOW(),decision_reason=$3 WHERE id=$4`,
+        [state,req.user.id,reason||null,id]);
+      // Persistent outbox; if EMAIL_PROVIDER is disabled, customer can still look up the decision.
+      if (r.customer_email) {
+        await client.query(`INSERT INTO reschedule_decision_notifications(request_id,recipient_email)
+          VALUES ($1,$2) ON CONFLICT (request_id) DO NOTHING`,[id,r.customer_email]);
+      }
+      await writeAudit(client,req.user.id,decision==='APPROVE'?'APPROVE_RESCHEDULE':'REJECT_RESCHEDULE',
+        'RESCHEDULE_REQUEST',id,{ bookingCode:r.booking_code, oldDate:r.old_booking_date,oldTimeSlot:r.old_time_slot,
+          newDate:r.new_booking_date,newTimeSlot:r.new_time_slot, decisionReason:reason });
+      await client.query('COMMIT');
+      return res.json({ id, status:state, bookingCode:r.booking_code,
+        message:decision==='APPROVE'
+          ?'Đã duyệt yêu cầu đổi lịch. Đã cập nhật lịch chụp và tạo thông báo kết quả cho khách.'
+          :'Đã từ chối yêu cầu đổi lịch. Lịch cũ được giữ nguyên và đã tạo thông báo kết quả cho khách.',
+        notification:'Thông báo trong hệ thống đã có; email chỉ được gửi khi cấu hình nhà cung cấp.' });
+    } catch(error) {
+      await client.query('ROLLBACK'); throw error;
     } finally { client.release(); }
   })
 );
