@@ -7,7 +7,14 @@ const money=(n:number)=>new Intl.NumberFormat('vi-VN').format(n)+'đ';
 type OwnerSummary={total:number;confirmed:number;checked_in:number;paid_revenue:number;total_staff:number;pending_refunds:number};
 type Staff={id:number;full_name:string;email:string;role:string;active:boolean;created_at:string};
 type Refund={id:number;booking_code:string;customer_name:string;requested_by_name:string;reason:string;amount_vnd:number;status:string;created_at:string};
-type Audit={id:number;action:string;entity_type:string;entity_id:string;details:Record<string,unknown>;created_at:string;full_name:string|null};
+type Audit={id:number;user_id:number|null;action:string;entity_type:string;entity_id:string;details:Record<string,unknown>|null;created_at:string;full_name:string|null;actor_email:string|null;actor_role:'EMPLOYEE'|'OWNER'|null};
+const AUDIT_ACTION_NAMES:Record<string,string>={
+  APPROVE_RESCHEDULE:'Duyệt đổi lịch', REJECT_RESCHEDULE:'Từ chối đổi lịch',
+  APPROVE_CANCELLATION:'Duyệt hủy đơn', REJECT_CANCELLATION:'Từ chối hủy đơn',
+  CANCEL_BOOKING:'Hủy đơn', REQUEST_REFUND:'Gửi yêu cầu hoàn tiền',
+  APPROVE_REFUND:'Phê duyệt hoàn tiền', REJECT_REFUND:'Từ chối hoàn tiền',
+  CHECK_IN:'Check-in', LOGIN:'Đăng nhập', CREATE_STAFF:'Thêm nhân viên', UPDATE_STAFF_STATUS:'Cập nhật nhân viên'
+};
 
 type PaymentReview={id:number;booking_code:string;issue_type:string;observed_amount_vnd:number;expected_amount_vnd:number;source:string;transaction_ref:string;created_at:string};
 
@@ -40,9 +47,36 @@ export function OwnerRefundsPage(){
 }
 
 export function OwnerAuditPage(){
-  const [rows,setRows]=useState<Audit[]>([]);const [error,setError]=useState('');
-  useEffect(()=>{api<Audit[]>('/owner/audit').then(setRows).catch(e=>setError(e.message));},[]);
-  return <><div className="content-heading"><div><span className="eyebrow">AUDIT LOG</span><h1>Nhật ký hệ thống</h1><p>Lịch sử đăng nhập, check-in, hủy đơn, tạo nhân viên và phê duyệt hoàn tiền.</p></div></div>{error&&<div className="error-box">{error}</div>}<div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Thời gian</th><th>Người thực hiện</th><th>Hành động</th><th>Đối tượng</th><th>Chi tiết</th></tr></thead><tbody>{rows.map(row=><tr key={row.id}><td>{new Date(row.created_at).toLocaleString('vi-VN')}</td><td>{row.full_name||'Khách / Hệ thống'}</td><td><strong>{row.action}</strong></td><td>{row.entity_type} #{row.entity_id}</td><td><code>{JSON.stringify(row.details)}</code></td></tr>)}{!rows.length&&<tr><td colSpan={5} className="empty-cell">Chưa có nhật ký.</td></tr>}</tbody></table></div></div></>;
+  const [rows,setRows]=useState<Audit[]>([]);
+  const [error,setError]=useState('');
+  const [query,setQuery]=useState('');
+  useEffect(()=>{api<Audit[]>('/owner/audit').then(setRows).catch(e=>setError(e instanceof Error?e.message:'Không tải được nhật ký.'));},[]);
+  const results=rows.filter(row=>{
+    const detail=row.details || {};
+    const search=[row.full_name,row.actor_email,row.action,AUDIT_ACTION_NAMES[row.action],
+      row.entity_type,row.entity_id,detail.bookingCode].map(x=>String(x??'')).join(' ').toLocaleLowerCase('vi-VN');
+    return search.includes(query.trim().toLocaleLowerCase('vi-VN'));
+  });
+  return <>
+    <div className="content-heading"><div><span className="eyebrow">AUDIT LOG</span><h1>Nhật ký hệ thống</h1><p>Theo dõi nhân viên xử lý đổi lịch, hủy đơn, check-in và các quyết định hoàn tiền.</p></div></div>
+    {error&&<div className="error-box">{error}</div>}
+    <div className="panel"><label>Tìm nhân viên hoặc mã đặt phòng
+      <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Tên nhân viên, email, mã đơn hoặc hành động" />
+    </label></div>
+    <div className="panel table-panel"><div className="table-scroll"><table>
+      <thead><tr><th>Thời gian</th><th>Người thực hiện</th><th>Hành động</th><th>Đối tượng</th><th>Chi tiết</th></tr></thead>
+      <tbody>{results.map(row=><tr key={row.id}>
+        <td>{new Date(row.created_at).toLocaleString('vi-VN')}</td>
+        <td><strong>{row.full_name || (row.user_id ? `Tài khoản #${row.user_id}` : 'Khách / Hệ thống')}</strong>
+          {row.actor_role&&<small>{row.actor_role==='EMPLOYEE'?'Nhân viên':'Chủ quán'}</small>}
+          {row.actor_email&&<small>{row.actor_email}</small>}
+        </td>
+        <td><strong>{AUDIT_ACTION_NAMES[row.action]||row.action}</strong></td>
+        <td>{row.entity_type} #{row.entity_id}</td>
+        <td><code>{String(row.details?.bookingCode||'')}</code><small>{JSON.stringify(row.details||{})}</small></td>
+      </tr>)}{!results.length&&<tr><td colSpan={5} className="empty-cell">Không tìm thấy nhật ký phù hợp.</td></tr>}</tbody>
+    </table></div></div>
+  </>;
 }
 export function OwnerBookingsPage() {
   type BookingRow = {

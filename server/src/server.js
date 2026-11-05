@@ -273,7 +273,7 @@ app.get('/api/bookings/:code/cancellation-requests',
   })
 );
 
-app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYEE','OWNER'),
+app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYEE'),
   asyncHandler(async(req,res)=>{
     const status=String(req.query.status||'PENDING').toUpperCase();
     if(!['PENDING','APPROVED','REJECTED','ALL'].includes(status))return res.status(400).json({message:'Bộ lọc không hợp lệ.'});
@@ -287,7 +287,7 @@ app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYE
   })
 );
 
-app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requireRole('EMPLOYEE','OWNER'),
+app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requireRole('EMPLOYEE'),
   asyncHandler(async(req,res)=>{
     const id=Number(req.params.id),decision=req.body?.decision;
     if(!Number.isSafeInteger(id)||id<1)return res.status(400).json({message:'Mã yêu cầu không hợp lệ.'});
@@ -298,7 +298,7 @@ app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requi
     try {
       await client.query('BEGIN');
       const actor=await client.query('SELECT id,role,active FROM users WHERE id=$1',[req.user.id]);
-      if(!actor.rowCount||!actor.rows[0].active||!['EMPLOYEE','OWNER'].includes(actor.rows[0].role)){
+      if(!actor.rowCount||!actor.rows[0].active||actor.rows[0].role !== 'EMPLOYEE'){
         await client.query('ROLLBACK');return res.status(403).json({message:'Tài khoản không có quyền xét duyệt.'});
       }
       const peek=await client.query(`SELECT b.room_id FROM booking_cancellation_requests c JOIN bookings b ON b.id=c.booking_id WHERE c.id=$1`,[id]);
@@ -467,8 +467,8 @@ app.get('/api/bookings/:code/reschedule-requests',
   })
 );
 
-// Both employees and owners may review rescheduling; every decision is checked server-side.
-app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYEE','OWNER'),
+// Only employees review rescheduling; owners monitor decisions through the audit log.
+app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYEE'),
   asyncHandler(async (req, res) => {
     const status = String(req.query.status || 'PENDING').toUpperCase();
     if (!['PENDING','APPROVED','REJECTED','CANCELLED','ALL'].includes(status)) return res.status(400).json({ message: 'Bộ lọc trạng thái không hợp lệ.' });
@@ -485,7 +485,7 @@ app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYE
 );
 
 app.patch('/api/management/reschedule-requests/:id/decision',
-  requireAuth, requireRole('EMPLOYEE','OWNER'),
+  requireAuth, requireRole('EMPLOYEE'),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ message: 'Mã yêu cầu đổi lịch không hợp lệ.' });
@@ -498,7 +498,7 @@ app.patch('/api/management/reschedule-requests/:id/decision',
       await client.query('BEGIN');
       // Revalidate account state; a revoked user cannot approve with an old JWT.
       const actor = await client.query('SELECT id,role,active FROM users WHERE id=$1', [req.user.id]);
-      if (!actor.rowCount || !actor.rows[0].active || !['EMPLOYEE','OWNER'].includes(actor.rows[0].role)) {
+      if (!actor.rowCount || !actor.rows[0].active || actor.rows[0].role !== 'EMPLOYEE') {
         await client.query('ROLLBACK'); return res.status(403).json({ message: 'Tài khoản không được phép xét duyệt yêu cầu.' });
       }
       // Booking creation locks the room first: preserve that order to avoid deadlocks.
@@ -997,7 +997,8 @@ app.get('/api/owner/email-notifications', requireAuth, requireRole('OWNER'), asy
 }));
 
 app.get('/api/owner/audit', requireAuth, requireRole('OWNER'), asyncHandler(async (_req, res) => {
-  const result = await pool.query(`SELECT a.id,a.action,a.entity_type,a.entity_id,a.details,a.created_at,u.full_name
+  const result = await pool.query(`SELECT a.id,a.user_id,a.action,a.entity_type,a.entity_id,a.details,a.created_at,
+    u.full_name,u.email AS actor_email,u.role AS actor_role
     FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 250`);
   res.json(result.rows);
 }));

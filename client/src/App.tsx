@@ -48,7 +48,6 @@ export default function App() {
         <Route index element={<OwnerDashboardPage/>}/>
         <Route path="nhan-vien" element={<OwnerStaffPage/>}/>
         <Route path="hoan-tien" element={<OwnerRefundsPage/>}/>
-        <Route path="doi-lich" element={<RescheduleManagementPage/>}/><Route path="huy-lich" element={<CancellationManagementPage/>}/>
         <Route path="nhat-ky" element={<OwnerAuditPage/>}/>
       </Route>
     </Route>

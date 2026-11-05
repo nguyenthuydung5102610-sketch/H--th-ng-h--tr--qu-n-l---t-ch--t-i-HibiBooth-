@@ -43,9 +43,7 @@ const OWNER_GROUPS: AdminNavGroup[] = [
     {to:'/chu-quan/don-dat',label:'Danh sách đặt phòng',icon:ClipboardList},
   ]},
   {title: 'PHÊ DUYỆT', items: [
-    {to:'/chu-quan/doi-lich',label:'Đổi lịch',icon:CalendarClock},
-    {to:'/chu-quan/huy-lich',label:'Hủy đơn',icon:CalendarX2},
-    {to:'/chu-quan/hoan-tien',label:'Hoàn tiền',icon:Wallet},
+    {to:'/chu-quan/hoan-tien',label:'Phê duyệt hoàn tiền',icon:Wallet},
   ]},
   {title: 'QUẢN TRỊ', items: [
     {to:'/chu-quan/nhan-vien',label:'Nhân viên',icon:Users},
