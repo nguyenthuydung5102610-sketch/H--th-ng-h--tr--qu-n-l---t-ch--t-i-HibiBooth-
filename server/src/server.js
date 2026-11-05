@@ -12,6 +12,7 @@ import { pool, writeAudit } from './db.js';
 import { requireAuth, requireRole } from './auth.js';
 import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, validateRescheduleDecision, canApproveReschedule, unavailableRescheduleSlots } from './reschedule-rules.js';
 import { cancellationMode, isCancellationReasonValid, validateCancellationDecision, validateCancellationReview, rollbackCancellation } from './cancellation-rules.js';
+import { HOLD_MINUTES, expireOverdueHolds, expireLockedHold, createHoldExpirationWorker } from './hold-expiration.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -83,8 +84,6 @@ app.get('/api/availability', asyncHandler(async (req, res) => {
   if (!isValidDate(String(date || '')) || !/^\d+$/.test(String(roomId || ''))) {
     return res.status(400).json({ message: 'Ngày hoặc phòng không hợp lệ.' });
   }
-  await pool.query(`UPDATE bookings SET status = 'EXPIRED', updated_at = NOW()
-    WHERE status = 'PENDING_PAYMENT' AND hold_expires_at < NOW()`);
   const result = await pool.query(
     `SELECT time_slot FROM bookings
      WHERE booking_date = $1 AND room_id = $2
@@ -129,8 +128,6 @@ app.post('/api/bookings', rateLimit({windowMs:15*60*1000,limit:20}), asyncHandle
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Không tìm thấy phòng chụp.' });
     }
-    await client.query(`UPDATE bookings SET status = 'EXPIRED', updated_at = NOW()
-      WHERE status = 'PENDING_PAYMENT' AND hold_expires_at < NOW()`);
     const occupied = await client.query(
       `SELECT id FROM bookings WHERE room_id = $1 AND booking_date = $2
        AND ABS((split_part(time_slot, ':', 1)::int * 60 + split_part(time_slot, ':', 2)::int) - $3) < $4
@@ -160,9 +157,9 @@ app.post('/api/bookings', rateLimit({windowMs:15*60*1000,limit:20}), asyncHandle
     const booking = await client.query(
       `INSERT INTO bookings (booking_code, customer_name, customer_phone, customer_email, room_id, package_id,
         booking_date, time_slot, amount_vnd, hold_expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW() + INTERVAL '20 minutes')
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW() + ($10::int * INTERVAL '1 minute'))
        RETURNING id, booking_code, amount_vnd, status, payment_status, hold_expires_at`,
-      [code, customerName.trim(), customerPhone.trim(), customerEmail.trim().toLowerCase(), Number(roomId), Number(packageId), date, timeSlot, pack.rows[0].price_vnd],
+      [code, customerName.trim(), customerPhone.trim(), customerEmail.trim().toLowerCase(), Number(roomId), Number(packageId), date, timeSlot, pack.rows[0].price_vnd, HOLD_MINUTES],
     );
     await writeAudit(client, null, 'CUSTOMER_CREATE_BOOKING', 'BOOKING', booking.rows[0].id, { bookingCode: code });
     await client.query('COMMIT');
@@ -180,8 +177,7 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   const phone = String(req.query.phone || '').replace(/[\s.-]/g,'');
   if (!isBookingCode(code)) return res.status(400).json({ message: 'Mã đặt phòng không đúng định dạng.' });
   if (!/^(03|05|07|08|09)\d{8}$/.test(phone)) return res.status(400).json({ message: 'Vui lòng nhập số điện thoại đã đăng ký (10 chữ số).' });
-  await pool.query(`UPDATE bookings SET status = 'EXPIRED', updated_at = NOW()
-    WHERE status = 'PENDING_PAYMENT' AND hold_expires_at < NOW()`);
+  await expireOverdueHolds(pool,{limit:1,bookingCode:code});
   const result = await pool.query(
     `SELECT b.booking_code, b.customer_name, b.customer_phone, b.booking_date, b.time_slot,
             b.amount_vnd, b.status, b.payment_status, b.hold_expires_at, b.created_at,
@@ -219,8 +215,7 @@ app.post('/api/bookings/:code/cancellation',
       const mode = cancellationMode(b.status, b.payment_status, { holdExpiresAt: b.hold_expires_at });
       if (mode === 'EXPIRED') {
         // A stale hold must not be treated as an active cancellation.
-        await client.query(`UPDATE bookings SET status='EXPIRED',updated_at=NOW()
-          WHERE id=$1 AND status='PENDING_PAYMENT' AND (hold_expires_at IS NULL OR hold_expires_at <= NOW())`,[b.id]);
+        await expireLockedHold(client,b.id);
         await client.query('COMMIT');
         return res.status(409).json({code:'HOLD_EXPIRED',message:'Giữ chỗ đã hết hạn. Không thể hủy một đơn đã hết hạn.'});
       }
@@ -231,8 +226,7 @@ app.post('/api/bookings/:code/cancellation',
           WHERE id=$1 AND status='PENDING_PAYMENT' AND payment_status='PENDING'
           AND hold_expires_at > NOW() RETURNING id`,[b.id]);
         if(!updated.rowCount){
-          await client.query(`UPDATE bookings SET status='EXPIRED',updated_at=NOW()
-            WHERE id=$1 AND status='PENDING_PAYMENT' AND (hold_expires_at IS NULL OR hold_expires_at <= NOW())`,[b.id]);
+          await expireLockedHold(client,b.id);
           await client.query('COMMIT');
           return res.status(409).json({code:'HOLD_EXPIRED',message:'Thời hạn giữ chỗ vừa kết thúc. Vui lòng tra cứu lại đơn.'});
         }
@@ -531,9 +525,7 @@ app.patch('/api/management/reschedule-requests/:id/decision',
         if (!canApproveReschedule(r.new_booking_date,r.new_time_slot,TIME_SLOTS)) {
           await client.query('ROLLBACK'); return res.status(409).json({ message: 'Khung giờ đề xuất đã quá gần hoặc không còn hợp lệ. Vui lòng từ chối để khách chọn giờ khác.' });
         }
-        await client.query(`UPDATE bookings SET status='EXPIRED',updated_at=NOW()
-          WHERE status='PENDING_PAYMENT' AND hold_expires_at<NOW()`);
-        const occupied = await client.query(`SELECT id FROM bookings
+            const occupied = await client.query(`SELECT id FROM bookings
           WHERE room_id=$1 AND booking_date=$2 AND id<>$3
             AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
             AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
@@ -585,22 +577,18 @@ app.patch('/api/management/reschedule-requests/:id/decision',
 app.get('/api/payments/bookings/:code', asyncHandler(async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!isBookingCode(code)) return res.status(400).json({ message: 'Mã đơn không hợp lệ.' });
+  await expireOverdueHolds(pool,{limit:1,bookingCode:code});
   const result = await pool.query(`SELECT b.booking_code,b.amount_vnd,b.status,b.payment_status,b.hold_expires_at,
     b.booking_date::text AS booking_date,b.time_slot,r.name AS room_name,
     p.qr_code,p.checkout_url FROM bookings b JOIN rooms r ON r.id=b.room_id LEFT JOIN payos_payment_requests p ON p.booking_id=b.id
     WHERE b.booking_code=$1`, [code]);
   if (!result.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn.' });
   const b = result.rows[0];
-  if (b.status==='PENDING_PAYMENT' && new Date(b.hold_expires_at) <= new Date()) {
-    await pool.query(`UPDATE bookings SET status='EXPIRED',updated_at=NOW()
-      WHERE booking_code=$1 AND status='PENDING_PAYMENT' AND hold_expires_at<=NOW()`, [code]);
-    b.status='EXPIRED';
-  }
   res.json({ mode: PAYMENT_MODE, bookingCode:b.booking_code, amountVnd:b.amount_vnd,
     status:b.status, paymentStatus:b.payment_status, holdExpiresAt:b.hold_expires_at,
     bookingDate:b.booking_date, timeSlot:b.time_slot, roomName:b.room_name, emailNotificationsEnabled:emailServiceEnabled(),
-    qrContent:PAYOS_ENABLED ? (b.qr_code || '') : `HIBI-DEMO-ONLY|${b.booking_code}|${b.amount_vnd}`,
-    checkoutUrl: PAYOS_ENABLED ? b.checkout_url : null,
+    qrContent:b.status==='PENDING_PAYMENT' ? (PAYOS_ENABLED ? (b.qr_code || '') : `HIBI-DEMO-ONLY|${b.booking_code}|${b.amount_vnd}`) : '',
+    checkoutUrl: b.status==='PENDING_PAYMENT' && PAYOS_ENABLED ? b.checkout_url : null,
     note: PAYOS_ENABLED ? 'Chỉ khi payOS xác nhận giao dịch hợp lệ, đơn mới được xác nhận.' : 'QR mô phỏng – không thể chuyển khoản.' });
 }));
 
@@ -1037,3 +1025,4 @@ app.use((error, _req, res, _next) => {
 
 app.listen(PORT, () => console.log(`Hibi Booth API đang chạy tại http://localhost:${PORT}`));
 startEmailNotificationWorker(pool);
+createHoldExpirationWorker(pool).start();

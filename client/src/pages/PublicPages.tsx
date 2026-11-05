@@ -98,8 +98,9 @@ export function BookingPage() {
         `/payments/bookings/${code}`, { signal: controller.signal },
       );
       setPaymentInfo(data);
-      setBooking(current => current || {
-        id: 0, booking_code: data.bookingCode, amount_vnd: data.amountVnd,
+      // Server status is authoritative even on QR retry or returning to a pending booking.
+      setBooking(current => current && current.booking_code !== data.bookingCode ? current : {
+        id: current?.id || 0, booking_code: data.bookingCode, amount_vnd: data.amountVnd,
         status: data.status, payment_status: data.paymentStatus,
         hold_expires_at: data.holdExpiresAt,
       });
@@ -160,6 +161,8 @@ export function BookingPage() {
     return () => window.clearInterval(timer);
   }, [booking?.booking_code, booking?.payment_status, paymentInfo?.mode]);
   const secondsLeft = Math.max(0, Math.floor((new Date(paymentInfo?.holdExpiresAt || booking?.hold_expires_at || Date.now()).getTime()-tick)/1000));
+  // Do not display a payable QR after the local countdown ends; the API verifies the final status.
+  const holdTimedOut = booking?.status==='PENDING_PAYMENT' && secondsLeft===0;
 
   async function submit(event: FormEvent) {
     event.preventDefault(); setError(''); setPaymentMessage('');
@@ -217,6 +220,9 @@ export function BookingPage() {
         {calendarUrl && <a className="button calendar-button full" href={calendarUrl} target="_blank" rel="noopener noreferrer"><CalendarPlus size={18}/> Thêm vào Google Calendar</a>}
         </>:
         booking.status==='PENDING_PAYMENT' ? <>
+        {holdTimedOut ? <><p role="status">Đã hết thời gian giữ chỗ. Mã QR được ẩn để tránh chuyển khoản muộn. Vui lòng kiểm tra lại trạng thái đơn.</p>
+          <button type="button" className="button light full" onClick={()=>void loadPaymentDetails(booking.booking_code)}>Kiểm tra trạng thái đơn</button></>
+        : <>
         {paymentInfo?.mode === 'PAYOS' ? (
           paymentInfo.qrContent ? <div className="qr-wrap">
             <QRCodeSVG value={paymentInfo.qrContent} size={190} includeMargin/>
@@ -232,7 +238,7 @@ export function BookingPage() {
         {!paymentInfo && !qrLoading && <button type="button" className="button light full" onClick={()=>void loadPaymentDetails(booking.booking_code)}>Tải lại thông tin thanh toán</button>}
 
         <p>Giữ chỗ còn: <strong>{Math.floor(secondsLeft/60)} phút {String(secondsLeft%60).padStart(2,'0')} giây</strong></p>
-        {paymentInfo?.mode==='DEMO_ONLY' && <button className="button primary full" onClick={confirmDemoPayment} disabled={loading || secondsLeft===0}>{loading?'Đang xác nhận...':'Mô phỏng thanh toán thành công'}</button>}</>:
+        {paymentInfo?.mode==='DEMO_ONLY' && <button className="button primary full" onClick={confirmDemoPayment} disabled={loading || secondsLeft===0}>{loading?'Đang xác nhận...':'Mô phỏng thanh toán thành công'}</button>}</> }</>:
         <div className="error-box">Đơn đã hết hạn hoặc không còn hợp lệ. Vui lòng tạo đơn mới.</div>
       }
       <div className="booking-code">{booking.booking_code}</div>

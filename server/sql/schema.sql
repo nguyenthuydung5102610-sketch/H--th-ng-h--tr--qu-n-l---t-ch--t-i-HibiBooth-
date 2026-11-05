@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS bookings (
 );
 CREATE INDEX IF NOT EXISTS idx_bookings_date_room_slot ON bookings(booking_date, room_id, time_slot);
 CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
+-- COMMIT 08: partial index for the automatic hold-expiration worker.
+CREATE INDEX IF NOT EXISTS idx_bookings_expiring_holds
+  ON bookings(hold_expires_at,id)
+  WHERE status='PENDING_PAYMENT' AND payment_status='PENDING';
 
 CREATE TABLE IF NOT EXISTS refunds (
   id BIGSERIAL PRIMARY KEY,
