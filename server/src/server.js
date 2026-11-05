@@ -13,6 +13,7 @@ import { requireAuth, requireRole } from './auth.js';
 import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, validateRescheduleDecision, canApproveReschedule, unavailableRescheduleSlots } from './reschedule-rules.js';
 import { cancellationMode, isCancellationReasonValid, validateCancellationDecision, validateCancellationReview, rollbackCancellation } from './cancellation-rules.js';
 import { HOLD_MINUTES, expireOverdueHolds, expireLockedHold, createHoldExpirationWorker } from './hold-expiration.js';
+import { syncVerifiedPayosPayment } from './payos-sync.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -666,30 +667,25 @@ app.post('/api/payments/bookings/:code/reconcile', rateLimit({windowMs:60*1000,l
   try {remote=await payos.paymentRequests.get(orderCode);}
   catch(err) {console.error('payOS reconciliation failed:',err.message);return res.status(502).json({message:'Chưa kiểm tra được trạng thái payOS; hệ thống sẽ thử lại.'});}
   if(remote?.status!=='PAID') return res.json({confirmed:false,paymentStatus:match.rows[0].payment_status});
-  if(Number(remote.amount)!==Number(match.rows[0].amount_vnd) || Number(remote.orderCode)!==orderCode)
-    return res.status(409).json({message:'Giao dịch payOS không khớp mã hoặc số tiền; cần đối soát.'});
-  const client=await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const r=await client.query(`SELECT id,status,payment_status,hold_expires_at FROM bookings WHERE id=$1 FOR UPDATE`,[match.rows[0].id]);
-    const b=r.rows[0];
-    if(b.payment_status==='PAID') {await client.query('COMMIT');return res.json({confirmed:true,paymentStatus:'PAID'});}
-    const inserted=await client.query(`INSERT INTO payment_events(booking_id,provider,provider_event_id,amount_vnd,result)
-      VALUES($1,'PAYOS',$2,$3,'RECEIVED') ON CONFLICT(provider,provider_event_id) DO NOTHING RETURNING id`,
-      [b.id,`${orderCode}:RECONCILED`,match.rows[0].amount_vnd]);
-    if(b.status==='PENDING_PAYMENT' && new Date(b.hold_expires_at)>new Date()) {
-      await client.query(`UPDATE bookings SET status='CONFIRMED',payment_status='PAID',hold_expires_at=NULL,updated_at=NOW() WHERE id=$1`,[b.id]);
-      if(inserted.rowCount) await client.query(`UPDATE payment_events SET result='VERIFIED' WHERE id=$1`,[inserted.rows[0].id]);
-      await scheduleBookingEmails(client,b.id);
-      await writeAudit(client,null,'PAYOS_RECONCILED','BOOKING',b.id,{orderCode});
-      await client.query('COMMIT');
-      return res.json({confirmed:true,paymentStatus:'PAID'});
-    }
-    if(inserted.rowCount) await client.query(`UPDATE payment_events SET result='REVIEW_REQUIRED' WHERE id=$1`,[inserted.rows[0].id]);
-    await writeAudit(client,null,'PAYOS_LATE_PAYMENT_REVIEW','BOOKING',b.id,{orderCode,status:b.status});
-    await client.query('COMMIT');
-    return res.json({confirmed:false,reviewRequired:true,paymentStatus:b.payment_status});
-  } catch(e) {await client.query('ROLLBACK');throw e;} finally {client.release();}
+  if (Number(remote.orderCode)!==orderCode) {
+    console.warn('Mã đơn payOS không trùng mã đã tra cứu.');
+    return res.status(409).json({confirmed:false,message:'payOS trả về mã giao dịch không khớp; cần kiểm tra thủ công.'});
+  }
+  // Remote status and data come directly from payOS, not from browser input.
+  // Keep the reference stable so repeated reconcile calls are idempotent.
+  const transactionRef = `RECONCILE-${orderCode}`;
+  const result = await syncVerifiedPayosPayment(pool, {
+    orderCode: Number(remote.orderCode), amount: Number(remote.amount),
+    reference: transactionRef, source: 'RECONCILE', currency: remote.currency || 'VND',
+  });
+  if (result.outcome==='UNKNOWN_ORDER') return res.status(404).json({message:'Mã thanh toán không tồn tại.'});
+  if (result.outcome==='AMOUNT_MISMATCH') return res.status(409).json({confirmed:false,reviewRequired:true,message:'Số tiền không khớp; chủ quán cần đối soát.'});
+  if (result.outcome==='ALREADY_PAID_CLOSED') return res.json({confirmed:false,paymentStatus:'PAID',bookingClosed:true});
+  if (result.outcome==='REVIEW_REQUIRED' || result.outcome==='ALREADY_PROCESSED')
+    return res.json({confirmed:false,reviewRequired:true,paymentStatus:result.paymentStatus||'PENDING'});
+  if (result.outcome==='CONFIRMED' || result.outcome==='ALREADY_CONFIRMED')
+    return res.json({confirmed:true,paymentStatus:'PAID'});
+  return res.status(422).json({confirmed:false,message:'Dữ liệu xác minh thanh toán không hợp lệ.'});
 }));
 
 // Chỉ thử trên máy: mô phỏng server nhận callback thành công sau khi đã đối chiếu.
@@ -722,48 +718,28 @@ app.post('/api/demo/bookings/:code/pay', rateLimit({ windowMs: 60*1000, limit: 1
   finally { client.release(); }
 }));
 
-// payOS signed webhook: verify signature, match orderCode and amount, then update atomically.
+// Signed payOS webhook: verify before using any data. Reconcile and webhook share
+// the same database transition to prevent duplicate notifications/status races.
 app.post('/api/payos/webhook', asyncHandler(async (req,res) => {
   if(!payos) return res.status(503).json({message:'payOS chưa được cấu hình.'});
   let event;
-  try { event=payos.webhooks.verify(req.body); }
+  try { event = await payos.webhooks.verify(req.body); }
   catch { return res.status(400).json({message:'Chữ ký payOS không hợp lệ.'}); }
-  if (!req.body?.success || (event?.code && event.code !== '00')) return res.json({success:true});
-  const orderCode=Number(event.orderCode), amount=Number(event.amount);
-  if (!Number.isSafeInteger(orderCode) || !Number.isSafeInteger(amount)) return res.status(400).json({message:'Dữ liệu giao dịch không hợp lệ.'});
-  const transactionRef=String(event.reference||'').trim();
-  if(!transactionRef) return res.status(400).json({message:'Thiếu mã giao dịch.'});
-  const client=await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const r=await client.query(`SELECT b.id,b.booking_code,b.amount_vnd,b.status,b.payment_status,b.hold_expires_at
-      FROM payos_payment_requests p JOIN bookings b ON b.id=p.booking_id
-      WHERE p.order_code=$1 FOR UPDATE OF b`,[orderCode]);
-    if(!r.rowCount) {await client.query('ROLLBACK');return res.status(404).json({message:'Không có yêu cầu thanh toán tương ứng.'});}
-    const b=r.rows[0];
-    if(amount!==b.amount_vnd) {
-      await writeAudit(client,null,'PAYOS_AMOUNT_MISMATCH','BOOKING',b.id,{orderCode,transactionRef,amount});
-      await client.query('COMMIT');
-      return res.status(409).json({message:'Số tiền không khớp; cần đối soát.'});
-    }
-    if(b.payment_status==='PAID') {await client.query('COMMIT');return res.json({success:true});}
-    const eventId=`${orderCode}:${transactionRef}`;
-    const inserted=await client.query(`INSERT INTO payment_events(booking_id,provider,provider_event_id,amount_vnd,result)
-      VALUES($1,'PAYOS',$2,$3,'RECEIVED') ON CONFLICT(provider,provider_event_id) DO NOTHING RETURNING id`,[b.id,eventId,amount]);
-    if(!inserted.rowCount) {await client.query('COMMIT');return res.json({success:true});}
-    if(b.status==='PENDING_PAYMENT' && new Date(b.hold_expires_at)>new Date()) {
-      await client.query(`UPDATE bookings SET status='CONFIRMED',payment_status='PAID',hold_expires_at=NULL,updated_at=NOW() WHERE id=$1`,[b.id]);
-      await client.query(`UPDATE payment_events SET result='VERIFIED' WHERE id=$1`,[inserted.rows[0].id]);
-      await scheduleBookingEmails(client,b.id);
-      await writeAudit(client,null,'PAYOS_PAYMENT_CONFIRMED','BOOKING',b.id,{orderCode,transactionRef});
-    } else {
-      // Payment received after hold expired or booking was cancelled: no room is reallocated.
-      await client.query(`UPDATE payment_events SET result='REVIEW_REQUIRED' WHERE id=$1`,[inserted.rows[0].id]);
-      await writeAudit(client,null,'PAYOS_LATE_PAYMENT_REVIEW','BOOKING',b.id,{orderCode,transactionRef,status:b.status});
-    }
-    await client.query('COMMIT');
-    res.json({success:true});
-  } catch(e) {await client.query('ROLLBACK');throw e;} finally {client.release();}
+  // Non-success callbacks are acknowledged, but never mark a booking paid.
+  if (req.body?.success!==true || req.body?.code!=='00' || event?.code!=='00') return res.json({success:true});
+  const result = await syncVerifiedPayosPayment(pool, {
+    orderCode:Number(event.orderCode), amount:Number(event.amount),
+    reference:String(event.reference||''), source:'WEBHOOK', currency:event.currency || 'VND',
+  });
+  if (result.outcome==='UNKNOWN_ORDER') {
+    // payOS may send a signed sample while registering the webhook.
+    console.warn('Webhook có chữ ký hợp lệ nhưng không có orderCode tương ứng:',event.orderCode);
+    return res.json({success:true,matched:false});
+  }
+  if (result.outcome.startsWith('INVALID_')) return res.status(400).json({message:'Dữ liệu webhook không hợp lệ.'});
+  // Mismatch/late payment is safely recorded for owner review; acknowledge to
+  // avoid provider retry storms (do NOT mark payment as successful).
+  res.json({success:true,confirmed:['CONFIRMED','ALREADY_CONFIRMED'].includes(result.outcome),reviewRequired:['REVIEW_REQUIRED','AMOUNT_MISMATCH'].includes(result.outcome)});
 }));
 
 app.post('/api/auth/login', asyncHandler(async (req, res) => {
@@ -973,6 +949,15 @@ app.patch('/api/owner/staff/:id/active', requireAuth, requireRole('OWNER'), asyn
   if (!result.rowCount) return res.status(404).json({ message: 'Không tìm thấy nhân viên.' });
   await pool.query(`INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details) VALUES ($1,'UPDATE_STAFF_STATUS','USER',$2,$3::jsonb)`, [req.user.id, result.rows[0].id, JSON.stringify({ active })]);
   res.json(result.rows[0]);
+}));
+
+// Manual review only: no automatic refund or room re-allocation.
+app.get('/api/owner/payment-reviews', requireAuth, requireRole('OWNER'), asyncHandler(async (_req,res) => {
+  const result=await pool.query(`SELECT c.id,c.issue_type,c.status,c.observed_amount_vnd,
+    c.transaction_ref,c.source,c.created_at,b.booking_code,b.amount_vnd AS expected_amount_vnd
+    FROM payment_reconciliation_cases c JOIN bookings b ON b.id=c.booking_id
+    WHERE c.status='OPEN' ORDER BY c.created_at DESC LIMIT 100`);
+  res.json(result.rows);
 }));
 
 app.get('/api/owner/refunds', requireAuth, requireRole('OWNER'), asyncHandler(async (_req, res) => {

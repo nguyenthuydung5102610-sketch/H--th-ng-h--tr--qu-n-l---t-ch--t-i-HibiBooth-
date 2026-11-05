@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS payment_events (
   UNIQUE (provider, provider_event_id)
 );
 
+-- COMMIT 09: durable manual reconciliation queue for verified but unallocatable
+-- or mismatched payments. Never mark these as paid automatically.
+CREATE TABLE IF NOT EXISTS payment_reconciliation_cases (
+  id BIGSERIAL PRIMARY KEY,
+  booking_id BIGINT NOT NULL REFERENCES bookings(id),
+  order_code BIGINT NOT NULL,
+  transaction_ref VARCHAR(100) NOT NULL,
+  issue_type VARCHAR(30) NOT NULL
+    CHECK(issue_type IN ('AMOUNT_MISMATCH','LATE_OR_INELIGIBLE')),
+  observed_amount_vnd INTEGER NOT NULL CHECK(observed_amount_vnd > 0),
+  source VARCHAR(16) NOT NULL CHECK(source IN ('WEBHOOK','RECONCILE')),
+  status VARCHAR(16) NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','RESOLVED')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(order_code,transaction_ref,issue_type)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_review_open
+  ON payment_reconciliation_cases(status,created_at DESC);
+
 -- Atomic counter per issuance date (Asia/Ho_Chi_Minh), preserves legacy booking codes.
 CREATE TABLE IF NOT EXISTS booking_daily_sequences (
   issue_date DATE PRIMARY KEY,
