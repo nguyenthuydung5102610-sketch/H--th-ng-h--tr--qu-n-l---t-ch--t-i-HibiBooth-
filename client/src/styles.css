@@ -149,3 +149,14 @@ body,button,input,select,textarea{font-family:'Be Vietnam Pro',Arial,sans-serif}
   .user-chip{border-top:0;}
   .admin-topbar{height:53px;}
 }
+
+/* COMMIT 12: explicit check-in preview and confirmation */
+.checkin-preview{margin:18px 0;padding:16px;border:1px solid var(--line);background:#fffcf8;border-radius:14px}
+.checkin-preview h3{margin:0 0 12px;font-size:1rem}
+.checkin-preview dl{display:grid;grid-template-columns:minmax(95px, 125px) 1fr;gap:9px 12px;margin:0 0 13px;font-size:.85rem}
+.checkin-preview dt{color:var(--muted)}
+.checkin-preview dd{margin:0;font-weight:700;overflow-wrap:anywhere}
+.checkin-eligible,.checkin-ineligible{padding:11px 12px;border-radius:10px;font-size:.82rem;line-height:1.55;margin:12px 0}
+.checkin-eligible{background:#e7f1e8;color:#215139}
+.checkin-ineligible{background:#fbebe6;color:#9a3824}
+@media(max-width:480px){.checkin-preview dl{grid-template-columns:1fr;gap:2px}.checkin-preview dd{margin-bottom:9px}}

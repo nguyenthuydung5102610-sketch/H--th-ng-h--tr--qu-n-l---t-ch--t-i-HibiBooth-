@@ -15,6 +15,7 @@ import { cancellationMode, isCancellationReasonValid, validateCancellationDecisi
 import { HOLD_MINUTES, expireOverdueHolds, expireLockedHold, createHoldExpirationWorker } from './hold-expiration.js';
 import { syncVerifiedPayosPayment } from './payos-sync.js';
 import { recoverOrCreatePayosLink, PayosLinkError } from './payos-link.js';
+import { parseCheckinCode, checkinEligibility, applyCheckin, CheckinError } from './checkin-rules.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -273,7 +274,7 @@ app.get('/api/bookings/:code/cancellation-requests',
   })
 );
 
-app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYEE'),
+app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYEE','OWNER'),
   asyncHandler(async(req,res)=>{
     const status=String(req.query.status||'PENDING').toUpperCase();
     if(!['PENDING','APPROVED','REJECTED','ALL'].includes(status))return res.status(400).json({message:'Bộ lọc không hợp lệ.'});
@@ -287,7 +288,7 @@ app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYE
   })
 );
 
-app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requireRole('EMPLOYEE'),
+app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requireRole('EMPLOYEE','OWNER'),
   asyncHandler(async(req,res)=>{
     const id=Number(req.params.id),decision=req.body?.decision;
     if(!Number.isSafeInteger(id)||id<1)return res.status(400).json({message:'Mã yêu cầu không hợp lệ.'});
@@ -298,7 +299,7 @@ app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requi
     try {
       await client.query('BEGIN');
       const actor=await client.query('SELECT id,role,active FROM users WHERE id=$1',[req.user.id]);
-      if(!actor.rowCount||!actor.rows[0].active||actor.rows[0].role !== 'EMPLOYEE'){
+      if(!actor.rowCount||!actor.rows[0].active||!['EMPLOYEE','OWNER'].includes(actor.rows[0].role)){
         await client.query('ROLLBACK');return res.status(403).json({message:'Tài khoản không có quyền xét duyệt.'});
       }
       const peek=await client.query(`SELECT b.room_id FROM booking_cancellation_requests c JOIN bookings b ON b.id=c.booking_id WHERE c.id=$1`,[id]);
@@ -467,8 +468,8 @@ app.get('/api/bookings/:code/reschedule-requests',
   })
 );
 
-// Only employees review rescheduling; owners monitor decisions through the audit log.
-app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYEE'),
+// Both employees and owners may review rescheduling; every decision is checked server-side.
+app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYEE','OWNER'),
   asyncHandler(async (req, res) => {
     const status = String(req.query.status || 'PENDING').toUpperCase();
     if (!['PENDING','APPROVED','REJECTED','CANCELLED','ALL'].includes(status)) return res.status(400).json({ message: 'Bộ lọc trạng thái không hợp lệ.' });
@@ -485,7 +486,7 @@ app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYE
 );
 
 app.patch('/api/management/reschedule-requests/:id/decision',
-  requireAuth, requireRole('EMPLOYEE'),
+  requireAuth, requireRole('EMPLOYEE','OWNER'),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ message: 'Mã yêu cầu đổi lịch không hợp lệ.' });
@@ -498,7 +499,7 @@ app.patch('/api/management/reschedule-requests/:id/decision',
       await client.query('BEGIN');
       // Revalidate account state; a revoked user cannot approve with an old JWT.
       const actor = await client.query('SELECT id,role,active FROM users WHERE id=$1', [req.user.id]);
-      if (!actor.rowCount || !actor.rows[0].active || actor.rows[0].role !== 'EMPLOYEE') {
+      if (!actor.rowCount || !actor.rows[0].active || !['EMPLOYEE','OWNER'].includes(actor.rows[0].role)) {
         await client.query('ROLLBACK'); return res.status(403).json({ message: 'Tài khoản không được phép xét duyệt yêu cầu.' });
       }
       // Booking creation locks the room first: preserve that order to avoid deadlocks.
@@ -789,46 +790,40 @@ app.get('/api/staff/bookings', requireAuth, requireRole('EMPLOYEE'), asyncHandle
   res.json(result.rows);
 }));
 
+// Validate before check-in. No database mutation, no audit entry.
+app.get('/api/staff/check-in/preview/:code', requireAuth, requireRole('EMPLOYEE'),
+  rateLimit({ windowMs:60_000, limit:60, standardHeaders:'draft-8', legacyHeaders:false }),
+  asyncHandler(async (req, res) => {
+    const code = parseCheckinCode(req.params.code);
+    if (!code) return res.status(400).json({ message: 'Mã QR hoặc mã đặt phòng không hợp lệ.' });
+    const result = await pool.query(`SELECT b.booking_code,b.customer_name,b.booking_date::text AS booking_date,
+        b.time_slot,b.status,b.payment_status,r.name AS room_name,p.name AS package_name
+      FROM bookings b JOIN rooms r ON r.id=b.room_id JOIN packages p ON p.id=b.package_id
+      WHERE b.booking_code=$1`, [code]);
+    if (!result.rowCount) return res.status(404).json({ message: 'Không tìm thấy mã đặt phòng.' });
+    const row = result.rows[0];
+    const eligibility = checkinEligibility(row);
+    res.json({ bookingCode: row.booking_code, customerName: row.customer_name,
+      bookingDate: row.booking_date, timeSlot: row.time_slot,
+      roomName: row.room_name, packageName: row.package_name,
+      allowed: eligibility.allowed, reason: eligibility.reason, message: eligibility.message });
+  })
+);
+
 app.post('/api/staff/check-in/:code', requireAuth, requireRole('EMPLOYEE'), asyncHandler(async (req, res) => {
-  const code = String(req.params.code || '').trim().toUpperCase();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    if (!isBookingCode(code)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Mã đặt phòng không hợp lệ.' });
-    }
-    const result = await client.query(`SELECT id,status,payment_status,booking_date::text AS booking_date,time_slot
-      FROM bookings WHERE booking_code=$1 FOR UPDATE`, [code]);
-    if (!result.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Không tìm thấy mã đặt phòng.' }); }
-    const booking = result.rows[0];
-    if (booking.status === 'CHECKED_IN') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ message: 'Đơn đã được check-in. Không thể quét hoặc nhập lại mã này.' });
-    }
-    if (booking.payment_status !== 'PAID' || booking.status !== 'CONFIRMED') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ message: 'Đơn chưa thanh toán hoặc không ở trạng thái đủ điều kiện check-in.' });
-    }
-    const check = checkinWindow(booking.booking_date, booking.time_slot);
-    if (check === 'EARLY') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ message: 'Chưa đến giờ nhận phòng. Có thể check-in sớm tối đa 30 phút.' });
-    }
-    if (check === 'LATE') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ message: 'Đã quá 20 phút sau giờ đặt. Không thể check-in; vui lòng liên hệ nhân viên để xử lý.' });
-    }
-    if (check !== 'OK') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Thời gian đặt phòng không hợp lệ.' });
-    }
-    await client.query(`UPDATE bookings SET status='CHECKED_IN', checked_in_at=NOW(), updated_at=NOW() WHERE id=$1`, [booking.id]);
-    await writeAudit(client, req.user.id, 'CHECK_IN', 'BOOKING', booking.id, { bookingCode: code });
+    const result = await applyCheckin({
+      client, rawCode: req.params.code, staffId: req.user.id, audit: writeAudit,
+    });
     await client.query('COMMIT');
-    res.json({ message: 'Check-in thành công.', bookingCode: code });
-  } catch (error) { await client.query('ROLLBACK'); throw error; }
-  finally { client.release(); }
+    res.json(result);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error instanceof CheckinError) return res.status(error.status).json({ message: error.message });
+    throw error;
+  } finally { client.release(); }
 }));
 
 app.post('/api/staff/bookings/:id/cancel', requireAuth, requireRole('EMPLOYEE'), asyncHandler(async (req, res) => {
@@ -997,8 +992,7 @@ app.get('/api/owner/email-notifications', requireAuth, requireRole('OWNER'), asy
 }));
 
 app.get('/api/owner/audit', requireAuth, requireRole('OWNER'), asyncHandler(async (_req, res) => {
-  const result = await pool.query(`SELECT a.id,a.user_id,a.action,a.entity_type,a.entity_id,a.details,a.created_at,
-    u.full_name,u.email AS actor_email,u.role AS actor_role
+  const result = await pool.query(`SELECT a.id,a.action,a.entity_type,a.entity_id,a.details,a.created_at,u.full_name
     FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 250`);
   res.json(result.rows);
 }));
