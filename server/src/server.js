@@ -17,6 +17,8 @@ import { syncVerifiedPayosPayment } from './payos-sync.js';
 import { recoverOrCreatePayosLink, PayosLinkError } from './payos-link.js';
 import { parseCheckinCode, checkinEligibility, applyCheckin, CheckinError } from './checkin-rules.js';
 import { recordAttendance, attendanceEligibility, AttendanceError } from './attendance-rules.js';
+import { decideRefundTransaction, RefundDecisionError } from './refund-decision.js';
+import { canRequestRefundAssistance, validRefundAssistanceReason } from './refund-assistance.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -185,14 +187,59 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   const result = await pool.query(
     `SELECT b.booking_code, b.customer_name, b.customer_phone, b.booking_date::text AS booking_date, b.time_slot,
             b.amount_vnd, b.status, b.payment_status, b.hold_expires_at, b.created_at,
+            (clock_timestamp() > ((b.booking_date + b.time_slot::time) AT TIME ZONE 'Asia/Ho_Chi_Minh') + INTERVAL '20 minutes') AS checkin_overdue,
+            cra.status AS refund_assistance_status,
             r.name AS room_name, p.name AS package_name
      FROM bookings b JOIN rooms r ON r.id=b.room_id JOIN packages p ON p.id=b.package_id
+     LEFT JOIN customer_refund_assistance cra ON cra.booking_id=b.id
      WHERE b.booking_code=$1 AND b.customer_phone=$2`, [code, phone],
   );
   if (!result.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn hoặc số điện thoại không khớp.' });
   const booking = result.rows[0];
-  res.json({ ...booking, customer_phone: maskPhone(booking.customer_phone), qr_content: canIssueCheckinQr(booking.status, booking.payment_status) ? `HIBI|${booking.booking_code}` : null });
+  const overdue = booking.status === 'CONFIRMED' && booking.payment_status === 'PAID' && booking.checkin_overdue;
+  res.json({ ...booking, customer_phone: maskPhone(booking.customer_phone),
+    refund_assistance_available: (booking.payment_status === 'PAID' && ['CANCELLED','NO_SHOW'].includes(booking.status)) || Boolean(overdue),
+    qr_content: !overdue && canIssueCheckinQr(booking.status, booking.payment_status) ? `HIBI|${booking.booking_code}` : null });
 }));
+
+// Customer can request a REFUND REVIEW after paid no-show/late arrival or paid cancellation.
+// The request does not approve a refund or move money.
+app.post('/api/bookings/:code/refund-assistance',
+  rateLimit({ windowMs:15*60*1000, limit:8, standardHeaders:'draft-8', legacyHeaders:false }),
+  asyncHandler(async (req, res) => {
+    const code=String(req.params.code || '').trim().toUpperCase();
+    const phone=normalizeCustomerPhone(req.body?.customerPhone);
+    const reason=req.body?.reason;
+    if (!isBookingCode(code) || !phone) return res.status(400).json({message:'Mã đơn hoặc số điện thoại không hợp lệ.'});
+    if (!validRefundAssistanceReason(reason)) return res.status(400).json({message:'Nhập lý do đề nghị hoàn tiền từ 5 đến 500 ký tự.'});
+    const client=await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result=await client.query(`SELECT id,booking_code,booking_date::text AS booking_date,time_slot,
+          status,payment_status FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
+      if(!result.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
+      const booking=result.rows[0];
+      const now=await client.query('SELECT clock_timestamp() AS db_now');
+      if(!canRequestRefundAssistance(booking, new Date(now.rows[0].db_now).getTime())) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({message:'Chỉ nhận đề nghị hoàn tiền cho đơn đã thanh toán và đã hủy hoặc quá 20 phút giờ check-in.'});
+      }
+      const existing=await client.query(`SELECT id FROM customer_refund_assistance WHERE booking_id=$1`,[booking.id]);
+      if(existing.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đơn này đã có đề nghị xem xét hoàn tiền. Vui lòng không gửi lại.'});}
+      const refund=await client.query(`SELECT id FROM refunds WHERE booking_id=$1
+          AND status IN ('PENDING_APPROVAL','APPROVED','COMPLETED') LIMIT 1`,[booking.id]);
+      if(refund.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đơn đã được chuyển sang quy trình hoàn tiền. Vui lòng liên hệ quán để theo dõi.'});}
+      const created=await client.query(`INSERT INTO customer_refund_assistance(booking_id,reason)
+          VALUES($1,$2) ON CONFLICT (booking_id) DO NOTHING RETURNING id,status`,[booking.id,reason.trim()]);
+      if(!created.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đã có đề nghị cho đơn này. Vui lòng không gửi trùng.'});}
+      await writeAudit(client,null,'CUSTOMER_REQUEST_REFUND_REVIEW','BOOKING',booking.id,
+        {bookingCode:code,assistanceId:created.rows[0].id,automaticRefund:false});
+      await client.query('COMMIT');
+      return res.status(201).json({status:'OPEN',message:'Đã gửi đề nghị xem xét hoàn tiền đến nhân viên. Chưa được phê duyệt và chưa chuyển tiền.'});
+    }catch(error){await client.query('ROLLBACK');throw error;}
+    finally{client.release();}
+  })
+);
 
 // CUSTOMER SELF-SERVICE: cancellation is effective immediately and never moves money.
 // Refund requests remain a separate staff -> owner approval workflow.
@@ -731,6 +778,17 @@ app.post('/api/staff/bookings/:id/cancel', requireAuth, requireRole('EMPLOYEE'),
   res.json({ message: 'Đã hủy đơn chưa thanh toán. Đơn đã thanh toán cần yêu cầu hoàn tiền và chủ quán phê duyệt.' });
 }));
 
+app.get('/api/staff/refund-assistance',requireAuth,requireRole('EMPLOYEE'),asyncHandler(async (_req,res)=>{
+  const result=await pool.query(`SELECT a.id,a.reason,a.status,a.created_at,
+    b.id AS booking_id,b.booking_code,b.customer_name,b.customer_phone,b.booking_date::text AS booking_date,
+    b.time_slot,b.amount_vnd,b.status AS booking_status,b.payment_status,
+    r.name AS room_name,p.name AS package_name
+    FROM customer_refund_assistance a JOIN bookings b ON b.id=a.booking_id
+    JOIN rooms r ON r.id=b.room_id JOIN packages p ON p.id=b.package_id
+    WHERE a.status='OPEN' ORDER BY a.created_at ASC LIMIT 100`);
+  res.json(result.rows);
+}));
+
 app.get('/api/staff/refunds', requireAuth, requireRole('EMPLOYEE'), asyncHandler(async (_req, res) => {
   const result = await pool.query(`SELECT rf.id, rf.reason, rf.amount_vnd, rf.status, rf.created_at,
     b.booking_code, b.customer_name, u.full_name AS requested_by_name
@@ -755,6 +813,7 @@ app.post('/api/staff/bookings/:id/refunds', requireAuth, requireRole('EMPLOYEE')
     if (pending.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ message: 'Đơn đã có yêu cầu hoàn tiền đang chờ duyệt.' }); }
     const refund = await client.query(`INSERT INTO refunds (booking_id,requested_by,reason,amount_vnd)
       VALUES ($1,$2,$3,$4) RETURNING id,status,amount_vnd`, [booking.id, req.user.id, reason.trim(), amount]);
+    await client.query(`UPDATE customer_refund_assistance SET status='FORWARDED',updated_at=NOW() WHERE booking_id=$1 AND status='OPEN'`,[booking.id]);
     await writeAudit(client, req.user.id, 'REQUEST_REFUND', 'REFUND', refund.rows[0].id, { bookingCode: booking.booking_code, amountVnd: amount });
     await client.query('COMMIT');
     res.status(201).json({ ...refund.rows[0], message: 'Đã gửi yêu cầu hoàn tiền đến chủ quán phê duyệt. Chưa có tiền được chuyển.' });
@@ -860,18 +919,18 @@ app.get('/api/owner/refunds', requireAuth, requireRole('OWNER'), asyncHandler(as
 }));
 
 app.patch('/api/owner/refunds/:id/decision', requireAuth, requireRole('OWNER'), asyncHandler(async (req, res) => {
-  const { decision } = req.body || {};
-  if (!['APPROVE','REJECT'].includes(decision)) return res.status(400).json({ message: 'Quyết định không hợp lệ.' });
-  const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
-  const result = await pool.query(`UPDATE refunds SET status=$1,approved_by=$2,decided_at=NOW()
-    WHERE id=$3 AND status='PENDING_APPROVAL' RETURNING id,booking_id,amount_vnd,status`, [status, req.user.id, req.params.id]);
-  if (!result.rowCount) return res.status(409).json({ message: 'Yêu cầu không còn ở trạng thái chờ duyệt.' });
-  if (decision === 'APPROVE') {
-    await pool.query("UPDATE bookings SET payment_status='REFUND_PENDING',updated_at=NOW() WHERE id=$1", [result.rows[0].booking_id]);
+  try {
+    const result = await decideRefundTransaction({
+      pool, refundId: req.params.id, ownerId: req.user.id,
+      decision: req.body?.decision, writeAudit,
+    });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof RefundDecisionError) {
+      return res.status(error.status).json({message:error.message});
+    }
+    throw error;
   }
-  await pool.query(`INSERT INTO audit_logs (user_id,action,entity_type,entity_id,details)
-    VALUES ($1,$2,'REFUND',$3,$4::jsonb)`, [req.user.id, decision === 'APPROVE' ? 'APPROVE_REFUND' : 'REJECT_REFUND', result.rows[0].id, JSON.stringify({ amountVnd: result.rows[0].amount_vnd })]);
-  res.json({ ...result.rows[0], message: decision === 'APPROVE' ? 'Đã duyệt yêu cầu. Cần tích hợp cổng thanh toán để thực hiện chuyển tiền thật.' : 'Đã từ chối yêu cầu hoàn tiền.' });
 }));
 
 app.get('/api/owner/sms-reminders', requireAuth, requireRole('OWNER'), asyncHandler(async (_req, res) => {

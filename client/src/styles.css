@@ -179,3 +179,11 @@ body,button,input,select,textarea{font-family:'Be Vietnam Pro',Arial,sans-serif}
 
 /* COMMIT 13: staff attendance actions */
 .attendance-note{display:inline-flex;align-items:center;padding:5px 8px;border-radius:8px;background:#e8efe6;color:var(--green);font-size:.68rem;font-weight:750;white-space:nowrap}
+
+/* Customer refund support and employee follow-up queue */
+.lookup-refund-support{border:1px solid var(--line);border-radius:16px;padding:17px;margin-top:20px;background:#fbfaf6}
+.lookup-refund-support h3{margin:0 0 8px;color:var(--green)}
+.lookup-refund-support p{font-size:.87rem;color:var(--muted);line-height:1.65;margin-bottom:14px}
+.refund-inquiry-row{display:flex;justify-content:space-between;align-items:center;gap:14px;border-top:1px solid var(--line);padding:14px 0}
+.refund-inquiry-row p{font-size:.84rem;color:var(--muted);margin:7px 0 0}
+@media(max-width:650px){.refund-inquiry-row{align-items:stretch;flex-direction:column}}

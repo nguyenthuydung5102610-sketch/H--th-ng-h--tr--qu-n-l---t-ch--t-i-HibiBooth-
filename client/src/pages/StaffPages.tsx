@@ -7,6 +7,7 @@ import { api, patch, post } from '../lib/api';
 const money = (n: number) => new Intl.NumberFormat('vi-VN').format(n) + 'đ';
 const statusName: Record<string,string> = { PENDING_PAYMENT:'Chờ thanh toán', CONFIRMED:'Đã xác nhận', CHECKED_IN:'Đã check-in', CANCELLED:'Đã hủy', EXPIRED:'Hết hạn', NO_SHOW:'Khách không đến' };
 type Booking = { id:number; booking_code:string; customer_name:string; customer_phone:string; booking_date:string; time_slot:string; amount_vnd:number; status:string; payment_status:string; room_name:string; package_name:string; attendance_kind?:'LATE_ARRIVAL'|'NO_SHOW'|null;attendance_note?:string|null;attendance_eligible?:boolean };
+type CustomerRefundAssistance = { id:number;booking_id:number;reason:string;status:string;created_at:string;booking_code:string;customer_name:string;customer_phone:string;booking_date:string;time_slot:string;amount_vnd:number;booking_status:string;payment_status:string;room_name:string;package_name:string };
 type Refund = { id:number; booking_code:string; customer_name:string; requested_by_name:string; reason:string; amount_vnd:number; status:string; created_at:string };
 
 function StatCard({ title, value, icon:Icon, tone='green' }: { title:string; value:string|number; icon:typeof CalendarCheck; tone?:string }) {
@@ -27,6 +28,7 @@ export function StaffDashboardPage() {
 
 export function StaffBookingsPage() {
   const [rows, setRows] = useState<Booking[]>([]);
+  const [refundInquiries,setRefundInquiries]=useState<CustomerRefundAssistance[]>([]);
   const [status, setStatus] = useState('ALL');
   const [date, setDate] = useState('');
   const [query, setQuery] = useState('');
@@ -42,7 +44,7 @@ export function StaffBookingsPage() {
 
   async function load() {
     setError('');
-    try { const params = new URLSearchParams(); if(status!=='ALL') params.set('status',status); if(date) params.set('date',date); if(query.trim()) params.set('q',query.trim()); setRows(await api<Booking[]>(`/staff/bookings?${params.toString()}`)); }
+    try { const params = new URLSearchParams(); if(status!=='ALL') params.set('status',status); if(date) params.set('date',date); if(query.trim()) params.set('q',query.trim()); const [bookings,requests]=await Promise.all([api<Booking[]>(`/staff/bookings?${params.toString()}`),api<CustomerRefundAssistance[]>('/staff/refund-assistance')]);setRows(bookings);setRefundInquiries(requests); }
     catch(e) { setError(e instanceof Error?e.message:'Không tải được danh sách đơn.'); }
   }
   useEffect(()=>{ void load(); },[status,date]);
@@ -84,6 +86,17 @@ export function StaffBookingsPage() {
   return <><div className="content-heading"><div><span className="eyebrow">BOOKING MANAGEMENT</span><h1>Quản lý đơn đặt phòng</h1><p>Tra cứu toàn bộ đơn và thực hiện các thao tác theo quyền nhân viên.</p></div></div>
     <div className="panel filter-panel"><div className="filter-row"><label>Tìm mã / tên / SĐT<input value={query} onChange={e=>setQuery(e.target.value)} placeholder="HB-... hoặc tên khách" onKeyDown={e=>e.key==='Enter'&&load()}/></label><label>Trạng thái<select value={status} onChange={e=>setStatus(e.target.value)}><option value="ALL">Tất cả</option>{Object.entries(statusName).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select></label><label>Ngày đặt<input type="date" value={date} onChange={e=>setDate(e.target.value)}/></label><button className="button primary filter-button" onClick={load}><Search size={16}/> Tìm kiếm</button></div></div>
     {error&&<div className="error-box">{error}</div>}{message&&<div className="notice">{message}</div>}
+    {refundInquiries.length>0 && <div className="panel table-panel" aria-label="Đề nghị hoàn tiền của khách">
+      <div className="table-title"><h3>Khách đề nghị xem xét hoàn tiền</h3><span>{refundInquiries.length} đề nghị chờ tiếp nhận</span></div>
+      {refundInquiries.map(r=><div className="refund-inquiry-row" key={r.id}>
+        <div><strong>{r.booking_code} · {r.customer_name}</strong><p>Lý do khách gửi: {r.reason}</p></div>
+        <button type="button" className="button tiny primary" onClick={()=>{
+          setRefundTarget({id:r.booking_id,booking_code:r.booking_code,customer_name:r.customer_name,customer_phone:r.customer_phone,booking_date:r.booking_date,time_slot:r.time_slot,amount_vnd:r.amount_vnd,status:r.booking_status,payment_status:r.payment_status,room_name:r.room_name,package_name:r.package_name});
+          setRefundReason(r.reason);setRefundAmount(String(r.amount_vnd));
+        }}>Tiếp nhận hoàn tiền</button>
+      </div>)}
+      <p className="field-hint">Nhân viên kiểm tra điều kiện và chuyển đề nghị đến chủ quán; chưa chuyển tiền cho khách.</p>
+    </div>}
     <div className="panel table-panel"><div className="table-title"><h3>Danh sách đơn</h3><span>{rows.length} kết quả</span></div><div className="table-scroll"><table><thead><tr><th>Mã đặt</th><th>Khách hàng</th><th>Lịch chụp</th><th>Phòng / Gói</th><th>Thanh toán</th><th>Trạng thái</th></tr></thead><tbody>{rows.map(row=><tr key={row.id}><td><strong>{row.booking_code}</strong><small>{money(row.amount_vnd)}</small></td><td>{row.customer_name}<small>{row.customer_phone}</small></td><td>{new Date(`${row.booking_date}T00:00:00`).toLocaleDateString('vi-VN')}<small>{row.time_slot}</small></td><td>{row.room_name}<small>{row.package_name}</small></td><td>{row.payment_status}</td><td><span className={`status status-${row.status.toLowerCase()}`}>{statusName[row.status]||row.status}</span></td><td><div className="table-actions">{row.status==='CONFIRMED'&&row.payment_status==='PAID'&&<button className="button tiny primary" onClick={()=>doCheckin(row)}>Check-in</button>}{row.status==='PENDING_PAYMENT'&&<button className="button tiny light" onClick={()=>cancel(row)}>Hủy</button>}{row.attendance_eligible&&<><button type="button" className="button tiny light" onClick={()=>openAttendance(row,'LATE_ARRIVAL')}>Đến trễ</button><button type="button" className="button tiny light" onClick={()=>openAttendance(row,'NO_SHOW')}>Không đến</button></>}{row.attendance_kind&&<span className="attendance-note" title={row.attendance_note||''}>{row.attendance_kind==='NO_SHOW'?'Đã ghi nhận vắng':'Đã ghi nhận trễ'}</span>}{row.payment_status==='PAID'&&<button className="button tiny light" onClick={()=>{setRefundTarget(row);setRefundAmount(String(row.amount_vnd));}}>Hoàn tiền</button>}</div></td></tr>)}{rows.length===0&&<tr><td colSpan={7} className="empty-cell">Chưa có đơn phù hợp. Hãy tạo đơn từ khu vực khách hàng để thử.</td></tr>}</tbody></table></div></div>
     {attendanceTarget&&<div className="modal-backdrop" role="presentation"><form className="modal panel" onSubmit={submitAttendance} aria-label="Ghi nhận tình trạng khách">
       <button type="button" className="modal-close" onClick={()=>{if(!attendanceBusy)setAttendanceTarget(null)}} aria-label="Đóng">×</button>

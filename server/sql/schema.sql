@@ -83,6 +83,20 @@ CREATE TABLE IF NOT EXISTS refunds (
   decided_at TIMESTAMPTZ
 );
 
+
+-- Customer-initiated request for a refund review. This is NOT an approved refund.
+-- One entry per booking avoids accidental repeated submissions.
+CREATE TABLE IF NOT EXISTS customer_refund_assistance (
+  id BIGSERIAL PRIMARY KEY,
+  booking_id BIGINT NOT NULL UNIQUE REFERENCES bookings(id),
+  reason VARCHAR(500) NOT NULL CHECK (char_length(btrim(reason)) BETWEEN 5 AND 500),
+  status VARCHAR(20) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','FORWARDED')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_customer_refund_assistance_status
+  ON customer_refund_assistance(status, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id BIGSERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id),
