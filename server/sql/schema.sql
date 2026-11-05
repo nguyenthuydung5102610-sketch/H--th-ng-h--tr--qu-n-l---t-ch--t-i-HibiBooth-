@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   time_slot VARCHAR(20) NOT NULL,
   amount_vnd INTEGER NOT NULL CHECK (amount_vnd >= 0),
   status VARCHAR(24) NOT NULL DEFAULT 'PENDING_PAYMENT'
-    CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN', 'CANCELLED', 'EXPIRED')),
+    CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN', 'CANCELLED', 'EXPIRED', 'NO_SHOW')),
   payment_status VARCHAR(24) NOT NULL DEFAULT 'PENDING'
     CHECK (payment_status IN ('PENDING', 'PAID', 'REFUND_PENDING', 'REFUNDED', 'FAILED')),
   hold_expires_at TIMESTAMPTZ,
@@ -44,6 +44,25 @@ CREATE TABLE IF NOT EXISTS bookings (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- COMMIT 13: migrate existing installs without deleting bookings or payments.
+-- PostgreSQL's default name for the original inline CHECK is bookings_status_check.
+ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check;
+ALTER TABLE bookings ADD CONSTRAINT bookings_status_check
+  CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN', 'CANCELLED', 'EXPIRED', 'NO_SHOW'));
+
+-- Record late arrival OR no-show per booking, with the acting employee.
+-- A UNIQUE constraint prevents conflicting outcomes; changes are audited.
+CREATE TABLE IF NOT EXISTS booking_attendance_incidents (
+  id BIGSERIAL PRIMARY KEY,
+  booking_id BIGINT NOT NULL UNIQUE REFERENCES bookings(id),
+  kind VARCHAR(20) NOT NULL CHECK(kind IN ('LATE_ARRIVAL','NO_SHOW')),
+  note VARCHAR(500) NOT NULL,
+  recorded_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_attendance_recorded_at
+  ON booking_attendance_incidents(created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_bookings_date_room_slot ON bookings(booking_date, room_id, time_slot);
 CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
 -- COMMIT 08: partial index for the automatic hold-expiration worker.

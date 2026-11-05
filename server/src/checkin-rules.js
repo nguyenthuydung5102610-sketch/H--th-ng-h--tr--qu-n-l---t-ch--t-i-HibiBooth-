@@ -23,7 +23,7 @@ export function checkinEligibility(booking, nowMs = Date.now()) {
   if (booking.status === 'CHECKED_IN') {
     return { allowed: false, reason: 'ALREADY_CHECKED_IN', message: 'Đơn đã check-in. Không thể sử dụng mã lần thứ hai.' };
   }
-  if (booking.status === 'CANCELLED' || booking.status === 'EXPIRED') {
+  if (booking.status === 'CANCELLED' || booking.status === 'EXPIRED' || booking.status === 'NO_SHOW') {
     return { allowed: false, reason: 'BOOKING_INACTIVE', message: 'Đơn đã hủy hoặc hết hạn, không thể check-in.' };
   }
   if (booking.payment_status !== 'PAID' || booking.status !== 'CONFIRMED') {

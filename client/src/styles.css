@@ -160,3 +160,22 @@ body,button,input,select,textarea{font-family:'Be Vietnam Pro',Arial,sans-serif}
 .checkin-eligible{background:#e7f1e8;color:#215139}
 .checkin-ineligible{background:#fbebe6;color:#9a3824}
 @media(max-width:480px){.checkin-preview dl{grid-template-columns:1fr;gap:2px}.checkin-preview dd{margin-bottom:9px}}
+
+/* COMMIT 13: single customer action chooser after booking lookup. */
+.lookup-actions{border-top:1px solid var(--line);margin-top:24px;padding-top:22px}
+.lookup-actions>h3{font-size:1.06rem;margin:0 0 15px}
+.lookup-action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.lookup-action-card{background:#fffefa;color:var(--ink);border:1px solid var(--line);border-radius:16px;padding:20px 12px;text-align:center;display:flex;align-items:center;flex-direction:column;gap:8px;cursor:pointer;min-width:0;transition:border-color .15s,box-shadow .15s,background-color .15s}
+.lookup-action-card svg{color:var(--green)}
+.lookup-action-card strong{font-size:.94rem}
+.lookup-action-card span{font-size:.7rem;color:var(--muted);line-height:1.5}
+.lookup-action-card:hover,.lookup-action-card.active{border-color:var(--green);background:#f1f7ef;box-shadow:0 6px 16px rgba(22,75,60,.1)}
+.lookup-action-card:focus-visible{outline:3px solid #c3d5c6;outline-offset:3px}
+.lookup-action-panel{margin-top:15px;padding:18px;background:#fdfcf8;border:1px solid var(--line);border-radius:15px}
+.lookup-action-panel>.reschedule-form{margin:0}
+.lookup-action-heading{display:flex;align-items:center;justify-content:space-between;gap:9px;margin-bottom:10px}
+.lookup-action-heading h3{margin:0}
+@media(max-width:480px){.lookup-action-card{padding:16px 8px}.lookup-action-card strong{font-size:.83rem}.lookup-action-panel{padding:12px}}
+
+/* COMMIT 13: staff attendance actions */
+.attendance-note{display:inline-flex;align-items:center;padding:5px 8px;border-radius:8px;background:#e8efe6;color:var(--green);font-size:.68rem;font-weight:750;white-space:nowrap}

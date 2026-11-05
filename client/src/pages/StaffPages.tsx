@@ -5,8 +5,8 @@ import { Html5QrcodeScanner } from 'html5-qrcode';
 import { api, patch, post } from '../lib/api';
 
 const money = (n: number) => new Intl.NumberFormat('vi-VN').format(n) + 'đ';
-const statusName: Record<string,string> = { PENDING_PAYMENT:'Chờ thanh toán', CONFIRMED:'Đã xác nhận', CHECKED_IN:'Đã check-in', CANCELLED:'Đã hủy', EXPIRED:'Hết hạn' };
-type Booking = { id:number; booking_code:string; customer_name:string; customer_phone:string; booking_date:string; time_slot:string; amount_vnd:number; status:string; payment_status:string; room_name:string; package_name:string };
+const statusName: Record<string,string> = { PENDING_PAYMENT:'Chờ thanh toán', CONFIRMED:'Đã xác nhận', CHECKED_IN:'Đã check-in', CANCELLED:'Đã hủy', EXPIRED:'Hết hạn', NO_SHOW:'Khách không đến' };
+type Booking = { id:number; booking_code:string; customer_name:string; customer_phone:string; booking_date:string; time_slot:string; amount_vnd:number; status:string; payment_status:string; room_name:string; package_name:string; attendance_kind?:'LATE_ARRIVAL'|'NO_SHOW'|null;attendance_note?:string|null;attendance_eligible?:boolean };
 type Refund = { id:number; booking_code:string; customer_name:string; requested_by_name:string; reason:string; amount_vnd:number; status:string; created_at:string };
 
 function StatCard({ title, value, icon:Icon, tone='green' }: { title:string; value:string|number; icon:typeof CalendarCheck; tone?:string }) {
@@ -35,6 +35,10 @@ export function StaffBookingsPage() {
   const [refundTarget, setRefundTarget] = useState<Booking|null>(null);
   const [refundReason, setRefundReason] = useState('');
   const [refundAmount, setRefundAmount] = useState('');
+  const [attendanceTarget, setAttendanceTarget] = useState<Booking|null>(null);
+  const [attendanceOutcome, setAttendanceOutcome] = useState<'LATE_ARRIVAL'|'NO_SHOW'>('LATE_ARRIVAL');
+  const [attendanceNote, setAttendanceNote] = useState('');
+  const [attendanceBusy,setAttendanceBusy]=useState(false);
 
   async function load() {
     setError('');
@@ -53,6 +57,24 @@ export function StaffBookingsPage() {
     try { const result=await post<{message:string}>(`/staff/bookings/${row.id}/cancel`);setMessage(result.message);await load(); }
     catch(e){setError(e instanceof Error?e.message:'Không thể hủy đơn.');}
   }
+  function openAttendance(row:Booking,outcome:'LATE_ARRIVAL'|'NO_SHOW') {
+    setAttendanceTarget(row);setAttendanceOutcome(outcome);setAttendanceNote('');setError('');setMessage('');
+  }
+  async function submitAttendance(event:FormEvent) {
+    event.preventDefault();
+    if(!attendanceTarget||attendanceBusy||attendanceNote.trim().length<5||attendanceNote.trim().length>500)return;
+    const booking=attendanceTarget;
+    if(!window.confirm(attendanceOutcome==='NO_SHOW'
+      ? `Xác nhận khách KHÔNG ĐẾN đơn ${booking.booking_code}? Suất đặt sẽ được giải phóng, nhưng không tự hoàn tiền.`
+      : `Ghi nhận khách ĐẾN TRỄ cho đơn ${booking.booking_code}? Thao tác này không phải check-in.`))return;
+    setError('');setMessage('');setAttendanceBusy(true);
+    try{
+      const result=await post<{message:string}>(`/staff/bookings/${booking.id}/attendance`,
+        {outcome:attendanceOutcome,note:attendanceNote.trim()});
+      setMessage(result.message);setAttendanceTarget(null);setAttendanceNote('');await load();
+    }catch(e){setError(e instanceof Error?e.message:'Không ghi nhận được tình trạng khách. Vui lòng kiểm tra lại.');}
+    finally{setAttendanceBusy(false);}
+  }
   async function submitRefund(event:FormEvent) {
     event.preventDefault(); if(!refundTarget) return;
     setError('');setMessage('');
@@ -62,7 +84,16 @@ export function StaffBookingsPage() {
   return <><div className="content-heading"><div><span className="eyebrow">BOOKING MANAGEMENT</span><h1>Quản lý đơn đặt phòng</h1><p>Tra cứu toàn bộ đơn và thực hiện các thao tác theo quyền nhân viên.</p></div></div>
     <div className="panel filter-panel"><div className="filter-row"><label>Tìm mã / tên / SĐT<input value={query} onChange={e=>setQuery(e.target.value)} placeholder="HB-... hoặc tên khách" onKeyDown={e=>e.key==='Enter'&&load()}/></label><label>Trạng thái<select value={status} onChange={e=>setStatus(e.target.value)}><option value="ALL">Tất cả</option>{Object.entries(statusName).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select></label><label>Ngày đặt<input type="date" value={date} onChange={e=>setDate(e.target.value)}/></label><button className="button primary filter-button" onClick={load}><Search size={16}/> Tìm kiếm</button></div></div>
     {error&&<div className="error-box">{error}</div>}{message&&<div className="notice">{message}</div>}
-    <div className="panel table-panel"><div className="table-title"><h3>Danh sách đơn</h3><span>{rows.length} kết quả</span></div><div className="table-scroll"><table><thead><tr><th>Mã đặt</th><th>Khách hàng</th><th>Lịch chụp</th><th>Phòng / Gói</th><th>Thanh toán</th><th>Trạng thái</th></tr></thead><tbody>{rows.map(row=><tr key={row.id}><td><strong>{row.booking_code}</strong><small>{money(row.amount_vnd)}</small></td><td>{row.customer_name}<small>{row.customer_phone}</small></td><td>{new Date(`${row.booking_date}T00:00:00`).toLocaleDateString('vi-VN')}<small>{row.time_slot}</small></td><td>{row.room_name}<small>{row.package_name}</small></td><td>{row.payment_status}</td><td><span className={`status status-${row.status.toLowerCase()}`}>{statusName[row.status]||row.status}</span></td><td><div className="table-actions">{row.status==='CONFIRMED'&&row.payment_status==='PAID'&&<button className="button tiny primary" onClick={()=>doCheckin(row)}>Check-in</button>}{row.status==='PENDING_PAYMENT'&&<button className="button tiny light" onClick={()=>cancel(row)}>Hủy</button>}{row.payment_status==='PAID'&&<button className="button tiny light" onClick={()=>{setRefundTarget(row);setRefundAmount(String(row.amount_vnd));}}>Hoàn tiền</button>}</div></td></tr>)}{rows.length===0&&<tr><td colSpan={7} className="empty-cell">Chưa có đơn phù hợp. Hãy tạo đơn từ khu vực khách hàng để thử.</td></tr>}</tbody></table></div></div>
+    <div className="panel table-panel"><div className="table-title"><h3>Danh sách đơn</h3><span>{rows.length} kết quả</span></div><div className="table-scroll"><table><thead><tr><th>Mã đặt</th><th>Khách hàng</th><th>Lịch chụp</th><th>Phòng / Gói</th><th>Thanh toán</th><th>Trạng thái</th></tr></thead><tbody>{rows.map(row=><tr key={row.id}><td><strong>{row.booking_code}</strong><small>{money(row.amount_vnd)}</small></td><td>{row.customer_name}<small>{row.customer_phone}</small></td><td>{new Date(`${row.booking_date}T00:00:00`).toLocaleDateString('vi-VN')}<small>{row.time_slot}</small></td><td>{row.room_name}<small>{row.package_name}</small></td><td>{row.payment_status}</td><td><span className={`status status-${row.status.toLowerCase()}`}>{statusName[row.status]||row.status}</span></td><td><div className="table-actions">{row.status==='CONFIRMED'&&row.payment_status==='PAID'&&<button className="button tiny primary" onClick={()=>doCheckin(row)}>Check-in</button>}{row.status==='PENDING_PAYMENT'&&<button className="button tiny light" onClick={()=>cancel(row)}>Hủy</button>}{row.attendance_eligible&&<><button type="button" className="button tiny light" onClick={()=>openAttendance(row,'LATE_ARRIVAL')}>Đến trễ</button><button type="button" className="button tiny light" onClick={()=>openAttendance(row,'NO_SHOW')}>Không đến</button></>}{row.attendance_kind&&<span className="attendance-note" title={row.attendance_note||''}>{row.attendance_kind==='NO_SHOW'?'Đã ghi nhận vắng':'Đã ghi nhận trễ'}</span>}{row.payment_status==='PAID'&&<button className="button tiny light" onClick={()=>{setRefundTarget(row);setRefundAmount(String(row.amount_vnd));}}>Hoàn tiền</button>}</div></td></tr>)}{rows.length===0&&<tr><td colSpan={7} className="empty-cell">Chưa có đơn phù hợp. Hãy tạo đơn từ khu vực khách hàng để thử.</td></tr>}</tbody></table></div></div>
+    {attendanceTarget&&<div className="modal-backdrop" role="presentation"><form className="modal panel" onSubmit={submitAttendance} aria-label="Ghi nhận tình trạng khách">
+      <button type="button" className="modal-close" onClick={()=>{if(!attendanceBusy)setAttendanceTarget(null)}} aria-label="Đóng">×</button>
+      <span className="eyebrow">TÌNH TRẠNG KHÁCH HÀNG</span>
+      <h2>{attendanceOutcome==='NO_SHOW'?'Xác nhận khách không đến':'Ghi nhận khách đến trễ'}</h2>
+      <p>Đơn {attendanceTarget.booking_code} · {attendanceTarget.customer_name} · {attendanceTarget.time_slot}</p>
+      <div className="notice notice-info">{attendanceOutcome==='NO_SHOW'?'Suất đặt được giải phóng sau khi xác nhận. Thanh toán vẫn được giữ nguyên; hoàn tiền phải qua quy trình riêng.':'Chỉ ghi nhận khách đến trễ, chưa check-in hoặc thay đổi lịch.'}</div>
+      <label>Ghi chú nhân viên<textarea value={attendanceNote} onChange={e=>setAttendanceNote(e.target.value)} minLength={5} maxLength={500} required placeholder="Mô tả tình huống thực tế (5–500 ký tự)"/></label>
+      <button className="button primary full" type="submit" disabled={attendanceBusy||attendanceNote.trim().length<5||attendanceNote.trim().length>500}>{attendanceBusy?'Đang ghi nhận...':'Xác nhận ghi nhận'}</button>
+    </form></div>}
     {refundTarget&&<div className="modal-backdrop"><form className="modal panel" onSubmit={submitRefund}><button type="button" className="modal-close" onClick={()=>setRefundTarget(null)}>×</button><span className="eyebrow">REFUND REQUEST</span><h2>Tạo yêu cầu hoàn tiền</h2><p>Đơn {refundTarget.booking_code} · {refundTarget.customer_name}</p><label>Lý do hoàn tiền<textarea value={refundReason} onChange={e=>setRefundReason(e.target.value)} required maxLength={500}/></label><label>Số tiền đề nghị hoàn<input type="number" min="1" max={refundTarget.amount_vnd} value={refundAmount} onChange={e=>setRefundAmount(e.target.value)} required/></label><div className="notice notice-info">Yêu cầu sẽ chuyển đến chủ quán phê duyệt. Chưa có tiền được hoàn tự động.</div><button className="button primary full">Gửi yêu cầu</button></form></div>}
   </>;
 }

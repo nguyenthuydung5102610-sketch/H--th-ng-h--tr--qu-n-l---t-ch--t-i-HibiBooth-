@@ -16,6 +16,7 @@ import { HOLD_MINUTES, expireOverdueHolds, expireLockedHold, createHoldExpiratio
 import { syncVerifiedPayosPayment } from './payos-sync.js';
 import { recoverOrCreatePayosLink, PayosLinkError } from './payos-link.js';
 import { parseCheckinCode, checkinEligibility, applyCheckin, CheckinError } from './checkin-rules.js';
+import { recordAttendance, attendanceEligibility, AttendanceError } from './attendance-rules.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -768,7 +769,8 @@ app.get('/api/staff/summary', requireAuth, requireRole('EMPLOYEE'), asyncHandler
     COUNT(*) FILTER (WHERE booking_date=CURRENT_DATE AND status IN ('CONFIRMED','CHECKED_IN'))::int AS today_total,
     COUNT(*) FILTER (WHERE status='CONFIRMED')::int AS awaiting_checkin,
     COUNT(*) FILTER (WHERE status='PENDING_PAYMENT')::int AS pending_payment,
-    COUNT(*) FILTER (WHERE status='CHECKED_IN')::int AS checked_in
+    COUNT(*) FILTER (WHERE status='CHECKED_IN')::int AS checked_in,
+    COUNT(*) FILTER (WHERE status='NO_SHOW')::int AS no_show
     FROM bookings`);
   res.json(result.rows[0]);
 }));
@@ -782,12 +784,17 @@ app.get('/api/staff/bookings', requireAuth, requireRole('EMPLOYEE'), asyncHandle
   if (q) { values.push(`%${String(q).slice(0,80)}%`); where.push(`(b.booking_code ILIKE $${values.length} OR b.customer_name ILIKE $${values.length} OR b.customer_phone ILIKE $${values.length})`); }
   const result = await pool.query(
     `SELECT b.id, b.booking_code, b.customer_name, b.customer_phone, b.booking_date, b.time_slot,
-       b.amount_vnd, b.status, b.payment_status, r.name AS room_name, p.name AS package_name
+       b.amount_vnd, b.status, b.payment_status, r.name AS room_name, p.name AS package_name,
+       ai.kind AS attendance_kind, ai.note AS attendance_note
      FROM bookings b JOIN rooms r ON r.id=b.room_id JOIN packages p ON p.id=b.package_id
+     LEFT JOIN booking_attendance_incidents ai ON ai.booking_id=b.id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
      ORDER BY b.booking_date DESC, b.time_slot DESC LIMIT 300`, values,
   );
-  res.json(result.rows);
+  res.json(result.rows.map(row => ({
+    ...row,
+    attendance_eligible: attendanceEligibility({ ...row, booking_date: row.booking_date.toISOString?.().slice(0,10) ?? row.booking_date }).allowed && !row.attendance_kind,
+  })));
 }));
 
 // Validate before check-in. No database mutation, no audit entry.
@@ -822,6 +829,23 @@ app.post('/api/staff/check-in/:code', requireAuth, requireRole('EMPLOYEE'), asyn
   } catch (error) {
     await client.query('ROLLBACK');
     if (error instanceof CheckinError) return res.status(error.status).json({ message: error.message });
+    throw error;
+  } finally { client.release(); }
+}));
+
+// COMMIT 13: explicit attendance decision, employee only. Never auto-refund.
+app.post('/api/staff/bookings/:id/attendance', requireAuth, requireRole('EMPLOYEE'), asyncHandler(async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await recordAttendance({ client, bookingId: req.params.id, staffId: req.user.id,
+      outcome: req.body?.outcome, note: req.body?.note, audit: writeAudit });
+    await client.query('COMMIT');
+    res.json(result);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error instanceof AttendanceError) return res.status(error.status).json({ message: error.message });
+    if (error.code === '23505') return res.status(409).json({ message: 'Đơn đã được xử lý trước đó. Vui lòng tải lại.' });
     throw error;
   } finally { client.release(); }
 }));
