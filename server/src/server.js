@@ -183,7 +183,7 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   if (!/^(03|05|07|08|09)\d{8}$/.test(phone)) return res.status(400).json({ message: 'Vui lòng nhập số điện thoại đã đăng ký (10 chữ số).' });
   await expireOverdueHolds(pool,{limit:1,bookingCode:code});
   const result = await pool.query(
-    `SELECT b.booking_code, b.customer_name, b.customer_phone, b.booking_date, b.time_slot,
+    `SELECT b.booking_code, b.customer_name, b.customer_phone, b.booking_date::text AS booking_date, b.time_slot,
             b.amount_vnd, b.status, b.payment_status, b.hold_expires_at, b.created_at,
             r.name AS room_name, p.name AS package_name
      FROM bookings b JOIN rooms r ON r.id=b.room_id JOIN packages p ON p.id=b.package_id
@@ -194,69 +194,76 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   res.json({ ...booking, customer_phone: maskPhone(booking.customer_phone), qr_content: canIssueCheckinQr(booking.status, booking.payment_status) ? `HIBI|${booking.booking_code}` : null });
 }));
 
-// COMMIT 06: customer cancellation. Unpaid holds are cancelled immediately;
-// paid bookings require a review and a separate owner refund approval.
+// CUSTOMER SELF-SERVICE: cancellation is effective immediately and never moves money.
+// Refund requests remain a separate staff -> owner approval workflow.
 app.post('/api/bookings/:code/cancellation',
-  rateLimit({ windowMs: 15*60*1000, limit: 8, standardHeaders: 'draft-8', legacyHeaders: false }),
-  asyncHandler(async (req, res) => {
-    const code = String(req.params.code || '').trim().toUpperCase();
-    const phone = normalizeCustomerPhone(req.body?.customerPhone);
-    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : null;
-    if (!isBookingCode(code) || !phone) return res.status(400).json({message:'Mã đơn hoặc số điện thoại không hợp lệ.'});
-    if (!isCancellationReasonValid(reason)) return res.status(400).json({message:'Nhập lý do hủy từ 5 đến 500 ký tự.'});
-    const client = await pool.connect();
+  rateLimit({windowMs:15*60*1000,limit:8,standardHeaders:'draft-8',legacyHeaders:false}),
+  asyncHandler(async (req,res)=>{
+    const code=String(req.params.code||'').trim().toUpperCase();
+    const phone=normalizeCustomerPhone(req.body?.customerPhone);
+    const reason=typeof req.body?.reason==='string' ? req.body.reason.trim() : null;
+    if(!isBookingCode(code)||!phone)return res.status(400).json({message:'Mã đơn hoặc số điện thoại không hợp lệ.'});
+    if(!isCancellationReasonValid(reason))return res.status(400).json({message:'Nhập lý do hủy từ 5 đến 500 ký tự.'});
+    const client=await pool.connect();
     try {
       await client.query('BEGIN');
-      // Lock order is ROOM -> BOOKING (same order as booking/reschedule flows).
-      // Reload booking after the lock so a concurrent webhook or reviewer cannot cause stale decisions.
-      const peek = await client.query('SELECT room_id FROM bookings WHERE booking_code=$1 AND customer_phone=$2',[code,phone]);
-      if (!peek.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'}); }
+      // Same room -> booking lock ordering as booking creation and rescheduling.
+      const peek=await client.query('SELECT room_id FROM bookings WHERE booking_code=$1 AND customer_phone=$2',[code,phone]);
+      if(!peek.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
       await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE',[peek.rows[0].room_id]);
-      const found = await client.query(`SELECT id,status,payment_status,booking_date::text AS booking_date,time_slot,hold_expires_at
-        FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
-      if (!found.rowCount) { await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'}); }
+      const found=await client.query(`SELECT id,status,payment_status,booking_date::text AS booking_date,
+        time_slot,hold_expires_at FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
+      if(!found.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
       const b=found.rows[0];
-      const mode = cancellationMode(b.status, b.payment_status, { holdExpiresAt: b.hold_expires_at });
-      if (mode === 'EXPIRED') {
-        // A stale hold must not be treated as an active cancellation.
+      const mode=cancellationMode(b.status,b.payment_status,{holdExpiresAt:b.hold_expires_at});
+      if(mode==='EXPIRED'){
         await expireLockedHold(client,b.id);
         await client.query('COMMIT');
-        return res.status(409).json({code:'HOLD_EXPIRED',message:'Giữ chỗ đã hết hạn. Không thể hủy một đơn đã hết hạn.'});
+        return res.status(409).json({code:'HOLD_EXPIRED',message:'Giữ chỗ đã hết hạn. Hãy tra cứu lại đơn.'});
       }
-      if (mode === 'IMMEDIATE') {
-        // Hủy hold chưa thanh toán; không tạo yêu cầu hoàn tiền.
-        // Recheck with PostgreSQL clock: hold may expire between reading and updating.
-        const updated=await client.query(`UPDATE bookings SET status='CANCELLED',updated_at=NOW()
-          WHERE id=$1 AND status='PENDING_PAYMENT' AND payment_status='PENDING'
-          AND hold_expires_at > NOW() RETURNING id`,[b.id]);
-        if(!updated.rowCount){
+      if(mode!=='IMMEDIATE'){
+        await client.query('ROLLBACK');
+        return res.status(409).json({message:'Đơn không còn đủ điều kiện tự hủy (đã hủy, hết giờ, check-in hoặc thanh toán chưa hợp lệ).'});
+      }
+      // PostgreSQL clock is authoritative; do not cancel a completed/started session.
+      const updated=await client.query(`UPDATE bookings SET status='CANCELLED',updated_at=NOW()
+        WHERE id=$1 AND (
+          (status='PENDING_PAYMENT' AND payment_status='PENDING' AND hold_expires_at>NOW()) OR
+          (status='CONFIRMED' AND payment_status='PAID' AND
+           ((booking_date + time_slot::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')>NOW())
+        ) RETURNING id,payment_status`,[b.id]);
+      if(!updated.rowCount){
+        if(b.status==='PENDING_PAYMENT'){
           await expireLockedHold(client,b.id);
           await client.query('COMMIT');
-          return res.status(409).json({code:'HOLD_EXPIRED',message:'Thời hạn giữ chỗ vừa kết thúc. Vui lòng tra cứu lại đơn.'});
-        }
-        await client.query(`UPDATE booking_reschedule_requests SET status='CANCELLED' WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
-        await writeAudit(client,null,'CUSTOMER_CANCEL_UNPAID','BOOKING',b.id,{bookingCode:code,reason});
-        await client.query('COMMIT');
-        return res.json({status:'CANCELLED',message:'Đã hủy đơn chưa thanh toán và giải phóng khung giờ.'});
+        } else await client.query('ROLLBACK');
+        return res.status(409).json({message:'Thời hạn hoặc trạng thái đơn vừa thay đổi. Vui lòng tra cứu lại.'});
       }
-      if (mode!=='REVIEW') {
-        await client.query('ROLLBACK');return res.status(409).json({message:'Trạng thái đơn hiện tại không cho phép gửi yêu cầu hủy.'});
+      // Resolve any legacy pending request without an employee or owner approval.
+      const pending=await client.query(`UPDATE booking_cancellation_requests
+        SET status='APPROVED',reason=$2,reviewed_by=NULL,reviewed_at=NOW(),
+          decision_reason='Khách tự hủy trên trang tra cứu'
+        WHERE booking_id=$1 AND status='PENDING' RETURNING id`,[b.id,reason]);
+      if(!pending.rowCount){
+        await client.query(`INSERT INTO booking_cancellation_requests
+          (booking_id,reason,status,reviewed_at,decision_reason)
+          VALUES($1,$2,'APPROVED',NOW(),'Khách tự hủy trên trang tra cứu')`,[b.id,reason]);
       }
-      const existing=await client.query(`SELECT id FROM booking_cancellation_requests WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
-      if (existing.rowCount) {await client.query('ROLLBACK');return res.status(409).json({message:'Đơn đã có yêu cầu hủy đang chờ xét duyệt.'});}
-      const other=await client.query(`SELECT id FROM booking_reschedule_requests WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
-      if (other.rowCount) {await client.query('ROLLBACK');return res.status(409).json({message:'Vui lòng xử lý yêu cầu đổi lịch đang chờ trước khi hủy đơn.'});}
-      const created=await client.query(`INSERT INTO booking_cancellation_requests(booking_id,reason) VALUES($1,$2) RETURNING id,status`,[b.id,reason]);
-      await writeAudit(client,null,'CUSTOMER_REQUEST_CANCELLATION','CANCELLATION_REQUEST',created.rows[0].id,{bookingCode:code});
+      await client.query(`UPDATE booking_reschedule_requests SET status='CANCELLED'
+        WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
+      await client.query(`UPDATE email_notifications SET status='SKIPPED'
+        WHERE booking_id=$1 AND kind='REMINDER' AND status IN ('PENDING','FAILED')`,[b.id]);
+      await client.query(`UPDATE sms_reminders SET status='SKIPPED'
+        WHERE booking_id=$1 AND status IN ('PENDING','FAILED')`,[b.id]);
+      await writeAudit(client,null,'CUSTOMER_CANCEL_BOOKING','BOOKING',b.id,
+        {bookingCode:code,reason,paid:updated.rows[0].payment_status==='PAID',refundAutomatic:false});
       await client.query('COMMIT');
-      res.status(201).json({...created.rows[0],message:'Đã gửi yêu cầu hủy. Lịch hiện tại được giữ nguyên cho đến khi nhân viên hoặc chủ quán duyệt. Hoàn tiền phải được chủ quán duyệt riêng.'});
-    } catch(error) {
-      if (error.code === '23505') {
-        await client.query('ROLLBACK');
-        return res.status(409).json({code:'DUPLICATE_CANCELLATION',message:'Yêu cầu hủy đã tồn tại. Vui lòng tra cứu lại trạng thái.'});
-      }
-      await rollbackCancellation(client,error);
-    } finally {client.release();}
+      return res.json({status:'CANCELLED',refundAutomatic:false,
+        message:updated.rows[0].payment_status==='PAID'
+          ?'Đã hủy lịch ngay. Tiền chưa được hoàn tự động; nhân viên sẽ tiếp nhận đề nghị hoàn tiền để chủ quán phê duyệt riêng.'
+          :'Đã hủy lịch và giải phóng chỗ giữ ngay.'});
+    }catch(error){await rollbackCancellation(client,error);}
+    finally{client.release();}
   })
 );
 
@@ -290,56 +297,9 @@ app.get('/api/management/cancellation-requests',requireAuth,requireRole('EMPLOYE
 );
 
 app.patch('/api/management/cancellation-requests/:id/decision',requireAuth,requireRole('EMPLOYEE','OWNER'),
-  asyncHandler(async(req,res)=>{
-    const id=Number(req.params.id),decision=req.body?.decision;
-    if(!Number.isSafeInteger(id)||id<1)return res.status(400).json({message:'Mã yêu cầu không hợp lệ.'});
-    const decisionError=validateCancellationDecision(req.body);
-    if(decisionError)return res.status(400).json({message:decisionError});
-    const reason=(req.body.decisionReason||'').trim();
-    const client=await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const actor=await client.query('SELECT id,role,active FROM users WHERE id=$1',[req.user.id]);
-      if(!actor.rowCount||!actor.rows[0].active||!['EMPLOYEE','OWNER'].includes(actor.rows[0].role)){
-        await client.query('ROLLBACK');return res.status(403).json({message:'Tài khoản không có quyền xét duyệt.'});
-      }
-      const peek=await client.query(`SELECT b.room_id FROM booking_cancellation_requests c JOIN bookings b ON b.id=c.booking_id WHERE c.id=$1`,[id]);
-      if(!peek.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy yêu cầu.'});}
-      // Same room -> booking lock ordering as creation / reschedule approval.
-      await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE',[peek.rows[0].room_id]);
-      const found=await client.query(`SELECT c.id,c.status AS request_status,c.booking_id,b.status AS booking_status,
-        b.payment_status,b.booking_code,b.amount_vnd FROM booking_cancellation_requests c
-        JOIN bookings b ON b.id=c.booking_id WHERE c.id=$1 FOR UPDATE OF c,b`,[id]);
-      if(!found.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy yêu cầu.'});}
-      const r=found.rows[0];
-      const reviewError=validateCancellationReview(r.request_status,r.booking_status,r.payment_status,decision);
-      if(reviewError){await client.query('ROLLBACK');return res.status(409).json({message:reviewError});}
-      if(decision==='APPROVE'){
-        // An active reschedule request has to be resolved first to avoid conflicting decisions.
-        const pendingReschedule=await client.query(`SELECT id FROM booking_reschedule_requests WHERE booking_id=$1 AND status='PENDING'`,[r.booking_id]);
-        if(pendingReschedule.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đơn có yêu cầu đổi lịch chờ duyệt; xử lý đổi lịch trước khi duyệt hủy.'});}
-        const current=await client.query(`SELECT 1 FROM refunds WHERE booking_id=$1 AND status IN ('PENDING_APPROVAL','APPROVED','COMPLETED')`,[r.booking_id]);
-        if(current.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đơn đã có quy trình hoàn tiền; cần kiểm tra thủ công.'});}
-        await client.query(`UPDATE bookings SET status='CANCELLED',updated_at=NOW() WHERE id=$1`,[r.booking_id]);
-        // Không giả lập chuyển tiền. Tạo yêu cầu hoàn tiền cho chủ quán quyết định.
-        await client.query(`INSERT INTO refunds(booking_id,requested_by,reason,amount_vnd)
-          VALUES($1,$2,$3,$4)`,[r.booking_id,req.user.id,'Khách yêu cầu hủy đặt phòng: '+r.booking_code,r.amount_vnd]);
-        await client.query(`UPDATE email_notifications SET status='SKIPPED' WHERE booking_id=$1 AND kind='REMINDER' AND status IN ('PENDING','FAILED')`,[r.booking_id]);
-        await client.query(`UPDATE sms_reminders SET status='SKIPPED' WHERE booking_id=$1 AND status IN ('PENDING','FAILED')`,[r.booking_id]);
-      }
-      await client.query(`UPDATE booking_cancellation_requests SET status=$1,reviewed_by=$2,
-        reviewed_at=NOW(),decision_reason=$3 WHERE id=$4`,[decision==='APPROVE'?'APPROVED':'REJECTED',req.user.id,reason||null,id]);
-      await writeAudit(client,req.user.id,decision==='APPROVE'?'APPROVE_CANCELLATION':'REJECT_CANCELLATION',
-        'CANCELLATION_REQUEST',id,{bookingCode:r.booking_code,decisionReason:reason});
-      await client.query('COMMIT');
-      res.json({message:decision==='APPROVE'?'Đã hủy đơn và tạo yêu cầu hoàn tiền để chủ quán xét duyệt. Chưa chuyển tiền.':'Đã từ chối yêu cầu; đơn vẫn giữ nguyên.'});
-    } catch(error){await rollbackCancellation(client,error);} finally{client.release();}
-  })
+  (_req,res)=>res.status(410).json({message:'Không còn xét duyệt hủy lịch. Khách tự hủy tại trang Tra cứu.'})
 );
 
-// COMMIT 06: Display available destinations before the customer submits a request.
-// The original booking is excluded because its slot will be released upon approval.
-// The decision API below still rechecks availability under a room lock.
 app.get('/api/bookings/:code/reschedule-availability',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }),
   asyncHandler(async (req, res) => {
@@ -371,86 +331,86 @@ app.get('/api/bookings/:code/reschedule-availability',
   })
 );
 
-// COMMIT 03: Customer submits a request for approval; this endpoint NEVER changes the booked slot.
+// CUSTOMER SELF-SERVICE: apply an available new slot atomically without staff approval.
 app.post('/api/bookings/:code/reschedule-requests',
-  rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false }),
-  asyncHandler(async (req, res) => {
-    const code = String(req.params.code || '').trim().toUpperCase();
-    if (!isBookingCode(code)) return res.status(400).json({ message: 'Mã đặt phòng không hợp lệ.' });
-    const validationError = validateRescheduleInput(req.body, TIME_SLOTS);
-    if (validationError) return res.status(400).json({ message: validationError });
-
-    const phone = normalizeCustomerPhone(req.body.customerPhone);
-    const { newDate, newTimeSlot } = req.body;
-    const reason = req.body.reason.trim();
-    const client = await pool.connect();
+  rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:'draft-8',legacyHeaders:false}),
+  asyncHandler(async(req,res)=>{
+    const code=String(req.params.code||'').trim().toUpperCase();
+    if(!isBookingCode(code))return res.status(400).json({message:'Mã đặt phòng không hợp lệ.'});
+    const validationError=validateRescheduleInput(req.body,TIME_SLOTS);
+    if(validationError)return res.status(400).json({message:validationError});
+    const phone=normalizeCustomerPhone(req.body.customerPhone);
+    const {newDate,newTimeSlot}=req.body;
+    const reason=req.body.reason.trim();
+    const client=await pool.connect();
     try {
       await client.query('BEGIN');
-      const found = await client.query(`
-        SELECT b.id, b.room_id, b.booking_date::text AS booking_date, b.time_slot,
-               b.status, b.payment_status
-        FROM bookings b
-        WHERE b.booking_code = $1 AND b.customer_phone = $2
-        FOR UPDATE OF b`, [code, phone]);
-      if (!found.rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ message: 'Không tìm thấy đơn hoặc số điện thoại không khớp.' });
+      const peek=await client.query('SELECT room_id FROM bookings WHERE booking_code=$1 AND customer_phone=$2',[code,phone]);
+      if(!peek.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
+      await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE',[peek.rows[0].room_id]);
+      const found=await client.query(`SELECT id,room_id,booking_date::text AS booking_date,time_slot,status,
+        payment_status FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
+      if(!found.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
+      const b=found.rows[0];
+      if(!canRequestReschedule(b.status,b.payment_status)){
+        await client.query('ROLLBACK');return res.status(409).json({message:'Chỉ đơn đã thanh toán, chưa check-in hoặc hủy mới được đổi lịch.'});
       }
-      const booking = found.rows[0];
-      if (!canRequestReschedule(booking.status, booking.payment_status)) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ message: 'Chỉ đơn đã thanh toán và đang được xác nhận mới có thể yêu cầu đổi lịch.' });
+      if(b.booking_date===newDate&&b.time_slot===newTimeSlot){
+        await client.query('ROLLBACK');return res.status(400).json({message:'Vui lòng chọn ngày hoặc giờ khác lịch hiện tại.'});
       }
-      if (booking.booking_date === newDate && booking.time_slot === newTimeSlot) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ message: 'Khung giờ mới phải khác lịch hiện tại.' });
+      if(!isBookableAt(newDate,newTimeSlot)){
+        await client.query('ROLLBACK');return res.status(409).json({message:'Giờ mới đã quá gần hoặc không còn hợp lệ.'});
       }
-      if (!isBookableAt(newDate, newTimeSlot)) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ message: 'Khung giờ mới không còn đủ thời gian đặt trước.' });
-      }
-      const cancellationPending = await client.query(`SELECT id FROM booking_cancellation_requests WHERE booking_id=$1 AND status='PENDING'`, [booking.id]);
-      if (cancellationPending.rowCount) {
-        await client.query('ROLLBACK'); return res.status(409).json({message:'Đơn đang chờ duyệt hủy; không thể đổi lịch.'});
-      }
-      const pending = await client.query(`SELECT id FROM booking_reschedule_requests
-        WHERE booking_id=$1 AND status='PENDING' LIMIT 1`, [booking.id]);
-      if (pending.rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ message: 'Đơn đã có yêu cầu đổi lịch đang chờ xét duyệt.' });
-      }
-      // Pre-check for an occupied destination. The eventual approval MUST recheck under room lock.
-      const occupied = await client.query(`SELECT id FROM bookings
-        WHERE room_id=$1 AND booking_date=$2 AND id<>$3
-          AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
-          AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
-          AND (status <> 'PENDING_PAYMENT' OR hold_expires_at>NOW()) LIMIT 1`,
-      [booking.room_id, newDate, booking.id, minuteOf(newTimeSlot), SESSION_MINUTES]);
-      if (occupied.rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ message: 'Phòng không còn trống vào khung giờ đề xuất. Vui lòng chọn giờ khác.' });
-      }
-      const created = await client.query(`INSERT INTO booking_reschedule_requests
-        (booking_id, requested_by, old_booking_date, old_time_slot, new_booking_date, new_time_slot, reason)
-        VALUES ($1, 'CUSTOMER', $2, $3, $4, $5, $6)
-        RETURNING id, status, new_booking_date::text AS new_booking_date, new_time_slot, created_at`,
-      [booking.id, booking.booking_date, booking.time_slot, newDate, newTimeSlot, reason]);
-      await writeAudit(client, null, 'CUSTOMER_REQUEST_RESCHEDULE', 'BOOKING', booking.id,
-        { requestId: created.rows[0].id, newDate, newTimeSlot });
+      // Room lock prevents competing bookings in the destination slot.
+      const occupied=await client.query(`SELECT id FROM bookings WHERE room_id=$1 AND booking_date=$2 AND id<>$3
+        AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
+        AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
+        AND (status <> 'PENDING_PAYMENT' OR hold_expires_at>NOW()) LIMIT 1`,
+        [b.room_id,newDate,b.id,minuteOf(newTimeSlot),SESSION_MINUTES]);
+      if(occupied.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Giờ mới vừa có khách đặt. Lịch cũ vẫn được giữ nguyên.'});}
+      // Reject a race with check-in, a cancellation, or passage of the original start time.
+      const updated=await client.query(`UPDATE bookings SET booking_date=$1,time_slot=$2,updated_at=NOW()
+        WHERE id=$3 AND status='CONFIRMED' AND payment_status='PAID'
+          AND ((booking_date + time_slot::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')>NOW()
+        RETURNING id`,[newDate,newTimeSlot,b.id]);
+      if(!updated.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Đã đến giờ chụp hoặc đơn vừa đổi trạng thái; lịch cũ không thay đổi.'});}
+      // Legacy pending approval requests cannot block the customer's direct action.
+      await client.query(`UPDATE booking_reschedule_requests SET status='CANCELLED'
+        WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
+      await client.query(`UPDATE booking_cancellation_requests
+        SET status='REJECTED',reviewed_at=NOW(),
+          decision_reason='Khách đã tự đổi lịch; yêu cầu hủy cũ đã đóng'
+        WHERE booking_id=$1 AND status='PENDING'`,[b.id]);
+      const created=await client.query(`INSERT INTO booking_reschedule_requests
+        (booking_id,requested_by,old_booking_date,old_time_slot,new_booking_date,new_time_slot,
+         reason,status,reviewed_by,reviewed_at,decision_reason)
+        VALUES($1,'CUSTOMER',$2,$3,$4,$5,$6,'APPROVED',NULL,NOW(),'Khách tự đổi lịch')
+        RETURNING id,status,new_booking_date::text AS new_booking_date,new_time_slot,created_at`,
+        [b.id,b.booking_date,b.time_slot,newDate,newTimeSlot,reason]);
+      // Keep the existing reminder queue synchronized with the new schedule.
+      await scheduleBookingEmails(client,b.id);
+      await client.query(`UPDATE email_notifications SET
+        due_at=GREATEST(NOW(),(($1::date+$2::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')-INTERVAL '1 hour'),
+        status='PENDING',attempts=0,claimed_at=NULL,sent_at=NULL,provider_message_id=NULL,error_message=NULL
+        WHERE booking_id=$3 AND kind='REMINDER' AND status IN ('PENDING','FAILED','SKIPPED','SUBMITTED')`,
+        [newDate,newTimeSlot,b.id]);
+      await client.query(`UPDATE sms_reminders SET
+        due_at=GREATEST(NOW(),(($1::date+$2::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')-INTERVAL '1 hour'),
+        status='PENDING',attempts=0,claimed_at=NULL,sent_at=NULL,provider_message_id=NULL,error_message=NULL
+        WHERE booking_id=$3 AND status IN ('PENDING','FAILED','SKIPPED','SUBMITTED')`,
+        [newDate,newTimeSlot,b.id]);
+      await writeAudit(client,null,'CUSTOMER_RESCHEDULE_BOOKING','BOOKING',b.id,
+        {bookingCode:code,oldDate:b.booking_date,oldTimeSlot:b.time_slot,newDate,newTimeSlot,reason});
       await client.query('COMMIT');
-      return res.status(201).json({
-        message: 'Đã gửi yêu cầu đổi lịch, đang chờ nhân viên hoặc chủ quán xét duyệt. Lịch hiện tại chưa thay đổi.',
-        request: created.rows[0],
-      });
-    } catch (error) {
+      return res.json({message:'Đổi lịch thành công. Ngày giờ mới đã được cập nhật ngay.',request:created.rows[0]});
+    }catch(error){
       await client.query('ROLLBACK');
-      if (error.code === '23505') return res.status(409).json({ message: 'Đơn đã có yêu cầu đổi lịch đang chờ xét duyệt.' });
+      if(error.code==='23505')return res.status(409).json({message:'Giờ hoặc yêu cầu vừa thay đổi. Hãy tra cứu lại.'});
       throw error;
-    } finally { client.release(); }
+    }finally{client.release();}
   })
 );
 
-// COMMIT 04: Customer can view the real approval result; never reveal other customers' requests.
 app.get('/api/bookings/:code/reschedule-requests',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }),
   asyncHandler(async (req, res) => {
@@ -486,95 +446,8 @@ app.get('/api/management/reschedule-requests', requireAuth, requireRole('EMPLOYE
   })
 );
 
-app.patch('/api/management/reschedule-requests/:id/decision',
-  requireAuth, requireRole('EMPLOYEE','OWNER'),
-  asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ message: 'Mã yêu cầu đổi lịch không hợp lệ.' });
-    const validationError = validateRescheduleDecision(req.body);
-    if (validationError) return res.status(400).json({ message: validationError });
-    const decision = req.body.decision;
-    const reason = String(req.body.decisionReason || '').trim();
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      // Revalidate account state; a revoked user cannot approve with an old JWT.
-      const actor = await client.query('SELECT id,role,active FROM users WHERE id=$1', [req.user.id]);
-      if (!actor.rowCount || !actor.rows[0].active || !['EMPLOYEE','OWNER'].includes(actor.rows[0].role)) {
-        await client.query('ROLLBACK'); return res.status(403).json({ message: 'Tài khoản không được phép xét duyệt yêu cầu.' });
-      }
-      // Booking creation locks the room first: preserve that order to avoid deadlocks.
-      const peek = await client.query(`SELECT b.room_id FROM booking_reschedule_requests r
-        JOIN bookings b ON b.id=r.booking_id WHERE r.id=$1`, [id]);
-      if (!peek.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Không tìm thấy yêu cầu đổi lịch.' }); }
-      await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE', [peek.rows[0].room_id]);
-      const found = await client.query(`SELECT r.id,r.booking_id,r.status AS request_status,r.old_booking_date::text AS old_booking_date,
-        r.old_time_slot,r.new_booking_date::text AS new_booking_date,r.new_time_slot,
-        b.booking_code,b.booking_date::text AS booking_date,b.time_slot,b.room_id,b.status AS booking_status,
-        b.payment_status,b.customer_email
-        FROM booking_reschedule_requests r JOIN bookings b ON b.id=r.booking_id
-        WHERE r.id=$1 FOR UPDATE OF r,b`, [id]);
-      if (!found.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Không tìm thấy yêu cầu đổi lịch.' }); }
-      const r = found.rows[0];
-      if (r.request_status !== 'PENDING') {
-        await client.query('ROLLBACK'); return res.status(409).json({ message: 'Yêu cầu này đã được xử lý trước đó.' });
-      }
-      if (!canRequestReschedule(r.booking_status,r.payment_status) ||
-          r.booking_date !== r.old_booking_date || r.time_slot !== r.old_time_slot) {
-        await client.query('ROLLBACK'); return res.status(409).json({ message: 'Lịch đặt phòng đã thay đổi hoặc không còn đủ điều kiện để xét duyệt.' });
-      }
-      if (decision === 'APPROVE') {
-        const cancelledRequest = await client.query(`SELECT 1 FROM booking_cancellation_requests WHERE booking_id=$1 AND status='PENDING'`,[r.booking_id]);
-        if (cancelledRequest.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({message:'Đơn đang chờ xử lý hủy; không thể duyệt đổi lịch.'}); }
-        if (!canApproveReschedule(r.new_booking_date,r.new_time_slot,TIME_SLOTS)) {
-          await client.query('ROLLBACK'); return res.status(409).json({ message: 'Khung giờ đề xuất đã quá gần hoặc không còn hợp lệ. Vui lòng từ chối để khách chọn giờ khác.' });
-        }
-            const occupied = await client.query(`SELECT id FROM bookings
-          WHERE room_id=$1 AND booking_date=$2 AND id<>$3
-            AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
-            AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
-            AND (status <> 'PENDING_PAYMENT' OR hold_expires_at>NOW()) LIMIT 1`,
-          [r.room_id,r.new_booking_date,r.booking_id,minuteOf(r.new_time_slot),SESSION_MINUTES]);
-        if (occupied.rowCount) {
-          await client.query('ROLLBACK'); return res.status(409).json({ message: 'Khung giờ mới vừa có khách đặt. Không thể phê duyệt, vui lòng đề xuất giờ khác hoặc từ chối yêu cầu.' });
-        }
-        await client.query(`UPDATE bookings SET booking_date=$1,time_slot=$2,updated_at=NOW()
-          WHERE id=$3`,[r.new_booking_date,r.new_time_slot,r.booking_id]);
-        await scheduleBookingEmails(client,r.booking_id);
-        // A booking change invalidates an unsent old reminder. Reset it to the new time.
-        await client.query(`UPDATE email_notifications SET
-            due_at=GREATEST(NOW(),(($1::date+$2::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')-INTERVAL '1 hour'),
-            status='PENDING',attempts=0,claimed_at=NULL,sent_at=NULL,provider_message_id=NULL,error_message=NULL
-          WHERE booking_id=$3 AND kind='REMINDER' AND status IN ('PENDING','FAILED','SKIPPED','SUBMITTED')`,
-          [r.new_booking_date,r.new_time_slot,r.booking_id]);
-        await client.query(`UPDATE sms_reminders SET
-          due_at=GREATEST(NOW(),(($1::date+$2::time) AT TIME ZONE 'Asia/Ho_Chi_Minh')-INTERVAL '1 hour'),
-          status='PENDING',attempts=0,claimed_at=NULL,sent_at=NULL,provider_message_id=NULL,error_message=NULL
-          WHERE booking_id=$3 AND status IN ('PENDING','FAILED','SKIPPED','SUBMITTED')`,
-          [r.new_booking_date,r.new_time_slot,r.booking_id]);
-      }
-      const state = decision==='APPROVE'?'APPROVED':'REJECTED';
-      await client.query(`UPDATE booking_reschedule_requests
-        SET status=$1,reviewed_by=$2,reviewed_at=NOW(),decision_reason=$3 WHERE id=$4`,
-        [state,req.user.id,reason||null,id]);
-      // Persistent outbox; if EMAIL_PROVIDER is disabled, customer can still look up the decision.
-      if (r.customer_email) {
-        await client.query(`INSERT INTO reschedule_decision_notifications(request_id,recipient_email)
-          VALUES ($1,$2) ON CONFLICT (request_id) DO NOTHING`,[id,r.customer_email]);
-      }
-      await writeAudit(client,req.user.id,decision==='APPROVE'?'APPROVE_RESCHEDULE':'REJECT_RESCHEDULE',
-        'RESCHEDULE_REQUEST',id,{ bookingCode:r.booking_code, oldDate:r.old_booking_date,oldTimeSlot:r.old_time_slot,
-          newDate:r.new_booking_date,newTimeSlot:r.new_time_slot, decisionReason:reason });
-      await client.query('COMMIT');
-      return res.json({ id, status:state, bookingCode:r.booking_code,
-        message:decision==='APPROVE'
-          ?'Đã duyệt yêu cầu đổi lịch. Đã cập nhật lịch chụp và tạo thông báo kết quả cho khách.'
-          :'Đã từ chối yêu cầu đổi lịch. Lịch cũ được giữ nguyên và đã tạo thông báo kết quả cho khách.',
-        notification:'Thông báo trong hệ thống đã có; email chỉ được gửi khi cấu hình nhà cung cấp.' });
-    } catch(error) {
-      await client.query('ROLLBACK'); throw error;
-    } finally { client.release(); }
-  })
+app.patch('/api/management/reschedule-requests/:id/decision',requireAuth,requireRole('EMPLOYEE','OWNER'),
+  (_req,res)=>res.status(410).json({message:'Không còn xét duyệt đổi lịch. Khách tự đổi sang giờ trống tại trang Tra cứu.'})
 );
 
 // Read-only status. Never trust a browser redirect as proof of payment.

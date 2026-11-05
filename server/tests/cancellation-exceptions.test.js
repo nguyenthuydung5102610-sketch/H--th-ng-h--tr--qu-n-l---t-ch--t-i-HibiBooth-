@@ -16,8 +16,8 @@ test('hold has expired exactly at deadline (boundary): reject cancellation',()=>
 test('old, missing or invalid expiry all block immediate cancellation',()=>{
   for(const x of [past,null,'bad-value']) assert.equal(cancellationMode('PENDING_PAYMENT','PENDING',{holdExpiresAt:x,nowMs:now}),'EXPIRED');
 });
-test('confirmed paid requires review, never auto refund',()=>{
-  assert.equal(cancellationMode('CONFIRMED','PAID'),'REVIEW');
+test('confirmed paid may self-cancel, but refund must remain separate',()=>{
+  assert.equal(cancellationMode('CONFIRMED','PAID'),'IMMEDIATE');
 });
 test('wrong payment state, checked-in, cancelled, expired cannot request cancellation',()=>{
   for(const [status,payment] of [['CONFIRMED','PENDING'],['CONFIRMED','REFUNDED'],['CHECKED_IN','PAID'],['CANCELLED','PAID'],['EXPIRED','PENDING'],['PENDING_PAYMENT','PAID']])

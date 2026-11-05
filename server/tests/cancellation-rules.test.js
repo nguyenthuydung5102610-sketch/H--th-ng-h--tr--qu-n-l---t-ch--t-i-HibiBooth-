@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cancellationMode, isCancellationReasonValid } from '../src/cancellation-rules.js';
-test('unpaid hold cancelled immediately; paid booking needs review',()=>{
+test('unpaid and paid bookings can be cancelled immediately',()=>{
  assert.equal(cancellationMode('PENDING_PAYMENT','PENDING'),'IMMEDIATE');
- assert.equal(cancellationMode('CONFIRMED','PAID'),'REVIEW');
+ assert.equal(cancellationMode('CONFIRMED','PAID'),'IMMEDIATE');
 });
 test('cannot cancel checked-in, expired or already cancelled bookings',()=>{
  for(const status of ['CHECKED_IN','CANCELLED','EXPIRED']) assert.equal(cancellationMode(status,'PAID'),'BLOCKED');

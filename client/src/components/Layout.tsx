@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { Camera, ShieldCheck, LogOut, LayoutDashboard, ClipboardList, ScanLine, Wallet, Users, ScrollText, CalendarClock, CalendarX2, Menu, X } from 'lucide-react';
+import { Camera, ShieldCheck, LogOut, LayoutDashboard, ClipboardList, ScanLine, Wallet, Users, ScrollText, Menu, X } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
 export function CustomerLayout() {
@@ -30,8 +30,6 @@ const STAFF_GROUPS: AdminNavGroup[] = [
     {to:'/nhan-vien/check-in',label:'Check-in QR',icon:ScanLine},
   ]},
   {title: 'XỬ LÝ YÊU CẦU', items: [
-    {to:'/nhan-vien/doi-lich',label:'Yêu cầu đổi lịch',icon:CalendarClock},
-    {to:'/nhan-vien/huy-lich',label:'Yêu cầu hủy đơn',icon:CalendarX2},
     {to:'/nhan-vien/hoan-tien',label:'Gửi yêu cầu hoàn tiền',icon:Wallet},
   ]},
 ];
@@ -43,7 +41,7 @@ const OWNER_GROUPS: AdminNavGroup[] = [
     {to:'/chu-quan/don-dat',label:'Danh sách đặt phòng',icon:ClipboardList},
   ]},
   {title: 'PHÊ DUYỆT', items: [
-    {to:'/chu-quan/hoan-tien',label:'Phê duyệt hoàn tiền',icon:Wallet},
+    {to:'/chu-quan/hoan-tien',label:'Hoàn tiền',icon:Wallet},
   ]},
   {title: 'QUẢN TRỊ', items: [
     {to:'/chu-quan/nhan-vien',label:'Nhân viên',icon:Users},

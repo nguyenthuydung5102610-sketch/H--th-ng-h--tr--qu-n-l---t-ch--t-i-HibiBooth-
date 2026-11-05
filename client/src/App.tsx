@@ -11,8 +11,6 @@ import {
   OwnerAuditPage
 } from './pages/OwnerPages';
 import { useAuth } from './context/AuthContext';
-import { RescheduleManagementPage } from './pages/RescheduleManagementPage';
-import {CancellationManagementPage} from './pages/CancellationManagementPage';
 
 function NotFound() {
   return <div className="narrow-page panel"><h1>Không tìm thấy trang</h1><p>Đường dẫn có thể đã thay đổi.</p><a className="button primary" href="/">Về trang chủ</a></div>;
@@ -38,7 +36,6 @@ export default function App() {
         <Route path="don-dat" element={<StaffBookingsPage/>}/>
         <Route path="check-in" element={<StaffCheckinPage/>}/>
         <Route path="hoan-tien" element={<StaffRefundsPage/>}/>
-        <Route path="doi-lich" element={<RescheduleManagementPage/>}/><Route path="huy-lich" element={<CancellationManagementPage/>}/>
       </Route>
     </Route>
 

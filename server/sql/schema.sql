@@ -210,6 +210,14 @@ CREATE TABLE IF NOT EXISTS booking_reschedule_requests (
     OR (status IN ('APPROVED', 'REJECTED') AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)
   )
 );
+-- CUSTOMER SELF-SERVICE MIGRATION: an approved customer reschedule has no staff reviewer.
+-- Reviewed legacy records remain valid; an automatic change records reviewed_at and a note.
+ALTER TABLE booking_reschedule_requests DROP CONSTRAINT IF EXISTS chk_reschedule_review_fields;
+ALTER TABLE booking_reschedule_requests ADD CONSTRAINT chk_reschedule_review_fields CHECK (
+  (status IN ('PENDING','CANCELLED') AND reviewed_by IS NULL AND reviewed_at IS NULL)
+  OR (status='APPROVED' AND reviewed_at IS NOT NULL)
+  OR (status='REJECTED' AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)
+);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_reschedule_one_pending_per_booking
   ON booking_reschedule_requests (booking_id)
   WHERE status = 'PENDING';

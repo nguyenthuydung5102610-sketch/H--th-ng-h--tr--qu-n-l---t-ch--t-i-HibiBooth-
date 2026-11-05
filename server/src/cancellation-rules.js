@@ -9,7 +9,7 @@ export function cancellationMode(status, paymentStatus, options = {}) {
     }
     return 'IMMEDIATE';
   }
-  if (status === 'CONFIRMED' && paymentStatus === 'PAID') return 'REVIEW';
+  if (status === 'CONFIRMED' && paymentStatus === 'PAID') return 'IMMEDIATE';
   return 'BLOCKED';
 }
 

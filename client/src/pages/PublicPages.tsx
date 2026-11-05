@@ -289,8 +289,8 @@ export function LookupPage() {
     event.preventDefault();
     if (loading || cancelReason.trim().length < 5 || cancelReason.trim().length > 500) return;
     const label=booking?.payment_status==='PAID'
-      ? 'Gửi yêu cầu hủy để nhân viên/chủ quán xét duyệt? Chưa thực hiện hoàn tiền.'
-      : 'Hủy ngay chỗ giữ chưa thanh toán? Thao tác này không thể khôi phục.';
+      ? 'Xác nhận hủy lịch ngay? Phòng sẽ được giải phóng, nhưng tiền chưa tự hoàn. Việc hoàn tiền cần xử lý riêng.'
+      : 'Xác nhận hủy lịch ngay? Thao tác này không thể khôi phục.';
     if (!window.confirm(label)) return;
     setError('');setMessage('');setLoading(true);
     try {
@@ -303,7 +303,7 @@ export function LookupPage() {
         const current=await api<LookupBooking>(`/bookings/lookup/${encodeURIComponent(bookingCode)}?phone=${encodeURIComponent(phone)}`);
         setBooking(current);setHistoryLoaded(true);
       } catch {
-        setError('Yêu cầu đã được ghi nhận nhưng chưa tải lại được trạng thái. Vui lòng tra cứu lại, KHÔNG gửi yêu cầu lần nữa.');
+        setError('Lịch đã được xử lý nhưng chưa tải lại được trạng thái. Vui lòng tra cứu lại, KHÔNG thực hiện lại.');
       }
     }catch(e){setError(e instanceof Error?e.message:'Không gửi được yêu cầu hủy.');}
     finally{setLoading(false);}
@@ -323,19 +323,23 @@ export function LookupPage() {
     finally { setLoading(false); }
   }
   async function submitReschedule(event:FormEvent) {
-    event.preventDefault(); setError(''); setMessage(''); setLoading(true);
+    event.preventDefault();
+    if (loading || !newTimeSlot || !newDate || !window.confirm(`Đổi lịch sang ${newTimeSlot} ngày ${newDate}? Lịch cũ sẽ được thay thế ngay.`)) return;
+    setError(''); setMessage(''); setLoading(true);
     try {
       const result=await post<{message:string}>(`/bookings/${encodeURIComponent(bookingCode)}/reschedule-requests`,
         { customerPhone:phone, newDate, newTimeSlot, reason:reason.trim() });
       setMessage(result.message);setNewDate('');setNewTimeSlot('');setReason('');setHistoryLoaded(false);
-      try { await Promise.all([reloadRequests(),reloadCancellation()]);setHistoryLoaded(true); }
-      catch { setError('Yêu cầu đổi lịch đã được gửi nhưng chưa tải lại trạng thái. Vui lòng tra cứu lại, không gửi lại yêu cầu.'); }
+      try {
+        const current=await api<LookupBooking>(`/bookings/lookup/${encodeURIComponent(bookingCode)}?phone=${encodeURIComponent(phone)}`);
+        setBooking(current);await Promise.all([reloadRequests(),reloadCancellation()]);setHistoryLoaded(true);
+      } catch { setError('Lịch đã được cập nhật nhưng chưa tải lại trạng thái. Hãy tra cứu lại, không đổi lần nữa.'); }
     } catch(e) { setError(e instanceof Error?e.message:'Không gửi được yêu cầu đổi lịch.'); }
     finally { setLoading(false); }
   }
   const canReschedule = booking?.status==='CONFIRMED' && booking.payment_status==='PAID';
-  const pending = requests.some(r=>r.status==='PENDING');
-  const cancelPending=cancellations.some(r=>r.status==='PENDING');
+  const pending = false; // Legacy requests do not block self-service.
+  const cancelPending=false; // Legacy pending cancellations never block self-service.
   useEffect(() => {
     setRescheduleAvailability(null);
     setAvailabilityError('');
@@ -352,7 +356,7 @@ export function LookupPage() {
       .finally(() => { if (active) setAvailabilityLoading(false); });
     return () => { active = false; };
   }, [booking, newDate, canReschedule, pending, cancelPending, phone]);
-  const requestLabels:Record<string,string> = {PENDING:'Đang chờ duyệt',APPROVED:'Đã chấp thuận',REJECTED:'Đã từ chối',CANCELLED:'Đã hủy'};
+  const requestLabels:Record<string,string> = {PENDING:'Yêu cầu cũ chưa xử lý',APPROVED:'Đã đổi lịch',REJECTED:'Yêu cầu cũ bị từ chối',CANCELLED:'Yêu cầu cũ đã đóng'};
   return <section className="narrow-page"><div className="page-intro"><span className="eyebrow">TRA CỨU ĐẶT PHÒNG</span><h1>Đơn đặt phòng của bạn.</h1><p>Nhập mã đặt phòng và số điện thoại đã đăng ký để bảo vệ thông tin cá nhân. Khách hàng không cần tạo tài khoản.</p></div>
     <div className="panel"><form onSubmit={lookup}><label>Mã đặt phòng<input className="code-input" value={code} onChange={e=>{setCode(e.target.value);setBooking(null);setSelectedAction(null);setHistoryLoaded(false);}} placeholder="HB-1004112006" required/></label>
       <label>Số điện thoại đã đặt<input type="tel" value={lookupPhone} onChange={e=>{setLookupPhone(e.target.value);setBooking(null);setSelectedAction(null);setHistoryLoaded(false);}} placeholder="09xxxxxxxx" required/></label>
@@ -370,14 +374,14 @@ export function LookupPage() {
             </button>
             <button type="button" className={`lookup-action-card ${selectedAction==='cancel'?'active':''}`}
               aria-expanded={selectedAction==='cancel'} onClick={()=>{setSelectedAction(selectedAction==='cancel'?null:'cancel');setError('');setMessage('');}}>
-              <Clock3 size={23}/><strong>Hủy lịch</strong><span>Gửi yêu cầu hủy đặt phòng</span>
+              <Clock3 size={23}/><strong>Hủy lịch</strong><span>Hủy ngay nếu đơn còn hợp lệ</span>
             </button>
           </div>
           {selectedAction==='reschedule' && <div className="lookup-action-panel">
             {!historyLoaded && <div className="error-box" role="alert">Chưa xác minh được lịch sử yêu cầu. Vui lòng tra cứu lại trước khi gửi yêu cầu mới.</div>}
             {requests.length>0 && <><div className="lookup-action-heading"><h3>Lịch sử đổi lịch</h3><button type="button" className="button light tiny" onClick={()=>void reloadRequests().catch(e=>setError(e instanceof Error?e.message:'Không cập nhật được.'))}>Làm mới</button></div>
               {requests.map(r=><div className="notice notice-info" key={r.id}><strong>{requestLabels[r.status]||r.status}</strong> · {r.new_booking_date.slice(0,10)} lúc {r.new_time_slot}<div>Lý do: {r.reason}</div>{r.decision_reason&&<div>Phản hồi: {r.decision_reason}</div>}</div>)}</>}
-            {historyLoaded && canReschedule && !pending && !cancelPending ? <form onSubmit={submitReschedule} className="reschedule-form"><h3>Gửi yêu cầu đổi lịch</h3><p>Lịch cũ chỉ thay đổi sau khi nhân viên duyệt.</p>
+            {historyLoaded && canReschedule && !pending && !cancelPending ? <form onSubmit={submitReschedule} className="reschedule-form"><h3>Đổi lịch</h3><p>Chọn giờ trống để đổi ngay, không cần phê duyệt.</p>
               <label>Ngày đề xuất<input type="date" min={today()} value={newDate} onChange={e=>{setNewDate(e.target.value);setNewTimeSlot('');}} required/></label>
               <div className="reschedule-time-picker"><strong>Chọn khung giờ còn trống</strong>
                 {!newDate && <p className="field-hint">Chọn ngày để xem giờ có thể đổi.</p>}
@@ -387,24 +391,24 @@ export function LookupPage() {
                   {rescheduleAvailability.timeSlots.map(slot=>{const unavailable=rescheduleAvailability.unavailable.includes(slot);return <button type="button" key={slot} className={`time-slot ${newTimeSlot===slot?'selected':''}`} aria-pressed={newTimeSlot===slot} disabled={unavailable||loading} onClick={()=>setNewTimeSlot(slot)}>{slot}{unavailable?' · Kín':''}</button>;})}
                 </div>}
                 {rescheduleAvailability && rescheduleAvailability.timeSlots.every(slot=>rescheduleAvailability.unavailable.includes(slot)) && <p className="field-hint">Ngày này đã kín. Vui lòng chọn ngày khác.</p>}
-                <p className="field-hint">Hệ thống sẽ kiểm tra lại khi nhân viên duyệt.</p>
+                <p className="field-hint">Hệ thống kiểm tra lại giờ trống ngay khi bạn xác nhận.</p>
               </div>
               <label>Lý do đổi lịch<textarea value={reason} onChange={e=>setReason(e.target.value)} minLength={5} maxLength={500} required placeholder="Vui lòng nhập ít nhất 5 ký tự"/></label>
-              <button className="button primary full" disabled={loading||availabilityLoading||!rescheduleAvailability||!newTimeSlot||rescheduleAvailability.unavailable.includes(newTimeSlot)}>Gửi yêu cầu đổi lịch</button>
-            </form> : <div className="notice notice-info">{!historyLoaded?'Chưa tải đủ trạng thái đơn. Hãy tra cứu lại.':pending?'Yêu cầu đổi lịch đang chờ nhân viên xử lý.':cancelPending?'Đơn đang chờ xử lý yêu cầu hủy.':'Đơn hiện không đủ điều kiện đổi lịch.'}</div>}
+              <button className="button primary full" disabled={loading||availabilityLoading||!rescheduleAvailability||!newTimeSlot||rescheduleAvailability.unavailable.includes(newTimeSlot)}>Xác nhận đổi lịch ngay</button>
+            </form> : <div className="notice notice-info">{!historyLoaded?'Chưa tải đủ trạng thái đơn. Hãy tra cứu lại.':pending?'Lịch sử có yêu cầu cũ chưa xử lý; bạn có thể tiếp tục tự đổi lịch.':cancelPending?'Đơn đang có yêu cầu hủy cũ.':'Đơn hiện không đủ điều kiện đổi lịch.'}</div>}
           </div>}
           {selectedAction==='cancel' && <div className="lookup-action-panel">
             {!historyLoaded && <div className="error-box" role="alert">Chưa xác minh được lịch sử yêu cầu. Vui lòng tra cứu lại trước khi gửi yêu cầu mới.</div>}
             {cancellations.length>0 && <><h3>Lịch sử hủy lịch</h3>{cancellations.map(r=><div className="notice notice-info" key={r.id}>
-              <strong>{r.status==='PENDING'?'Đang chờ duyệt hủy':r.status==='APPROVED'?'Đã chấp thuận hủy':'Đã từ chối hủy'}</strong>
+              <strong>{r.status==='PENDING'?'Yêu cầu cũ chưa xử lý':r.status==='APPROVED'?'Đã hủy lịch':'Yêu cầu cũ bị từ chối'}</strong>
               <div>Lý do: {r.reason}</div>{r.decision_reason&&<div>Phản hồi: {r.decision_reason}</div>}
             </div>)}</>}
             {historyLoaded&&!cancelPending&&!pending&&((booking.status==='CONFIRMED'&&booking.payment_status==='PAID')||(booking.status==='PENDING_PAYMENT'&&booking.payment_status==='PENDING'))
-              ? <form onSubmit={sendCancellation} className="reschedule-form"><h3>Yêu cầu hủy lịch</h3>
-                <p>{booking.payment_status==='PAID'?'Nhân viên sẽ xét duyệt hủy. Hoàn tiền được phê duyệt riêng, không tự chuyển tiền.':'Đơn chưa thanh toán sẽ được hủy ngay và giải phóng chỗ giữ.'}</p>
+              ? <form onSubmit={sendCancellation} className="reschedule-form"><h3>Hủy lịch</h3>
+                <p>{booking.payment_status==='PAID'?'Hủy có hiệu lực ngay. Nếu đã thanh toán, vui lòng liên hệ nhân viên để gửi đề nghị hoàn tiền; chủ quán phê duyệt riêng.':'Đơn chưa thanh toán sẽ được hủy ngay và giải phóng chỗ giữ.'}</p>
                 <label>Lý do hủy<input value={cancelReason} onChange={e=>setCancelReason(e.target.value)} minLength={5} maxLength={500} required placeholder="Vui lòng nhập lý do hủy"/></label>
                 <button className="button light full" disabled={loading||cancelReason.trim().length<5||cancelReason.trim().length>500}>{loading?'Đang gửi yêu cầu...':'Gửi yêu cầu hủy lịch'}</button>
-              </form> : <div className="notice notice-info">{!historyLoaded?'Chưa tải đủ trạng thái đơn. Hãy tra cứu lại.':cancelPending?'Yêu cầu hủy đang chờ nhân viên xử lý.':pending?'Đơn đang có yêu cầu đổi lịch chờ duyệt.':'Đơn hiện không đủ điều kiện hủy lịch.'}</div>}
+              </form> : <div className="notice notice-info">{!historyLoaded?'Chưa tải đủ trạng thái đơn. Hãy tra cứu lại.':cancelPending?'Yêu cầu hủy cũ đang được ghi nhận.':pending?'Đơn có yêu cầu đổi lịch cũ.':'Đơn hiện không đủ điều kiện hủy lịch.'}</div>}
           </div>}
         </div>
       </div>}
