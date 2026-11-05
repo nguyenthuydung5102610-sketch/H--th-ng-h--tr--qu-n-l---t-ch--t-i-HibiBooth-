@@ -228,13 +228,14 @@ export function BookingPage() {
             <QRCodeSVG value={paymentInfo.qrContent} size={190} includeMargin/>
             <span>QR THANH TOÁN PAYOS</span>
           </div> : qrLoading ? <div className="qr-loading" role="status">Đang lấy mã QR...</div>
-          : <div className="qr-unavailable">Chưa có mã QR thanh toán.</div>
+          : paymentInfo.checkoutUrl ? <div className="qr-unavailable" role="status">QR chưa hiển thị. Bạn có thể mở trang thanh toán payOS bên dưới để xem mã.</div>
+          : <div className="qr-unavailable">Chưa tạo được mã QR thanh toán. Vui lòng thử lại.</div>
         ) : paymentInfo?.mode === 'DEMO_ONLY' ? (
           <div className="qr-unavailable">Chế độ mô phỏng · Không chuyển tiền thật</div>
         ) : qrLoading ? <div className="qr-loading" role="status">Đang kiểm tra thanh toán...</div>
         : <div className="qr-unavailable">Chưa tải được thông tin thanh toán.</div>}
         {paymentInfo?.mode==='PAYOS' && paymentInfo.checkoutUrl && <a className="button primary full" href={paymentInfo.checkoutUrl} target="_blank" rel="noopener noreferrer">Mở trang thanh toán payOS</a>}
-        {paymentInfo?.mode==='PAYOS' && !paymentInfo.qrContent && !qrLoading && <button type="button" className="button light full" onClick={()=>void loadPaymentDetails(booking.booking_code)}>Thử tải lại mã QR</button>}
+        {paymentInfo?.mode==='PAYOS' && !paymentInfo.qrContent && !qrLoading && <button type="button" className="button light full" onClick={()=>void loadPaymentDetails(booking.booking_code)}>Kiểm tra lại mã QR</button>}
         {!paymentInfo && !qrLoading && <button type="button" className="button light full" onClick={()=>void loadPaymentDetails(booking.booking_code)}>Tải lại thông tin thanh toán</button>}
 
         <p>Giữ chỗ còn: <strong>{Math.floor(secondsLeft/60)} phút {String(secondsLeft%60).padStart(2,'0')} giây</strong></p>

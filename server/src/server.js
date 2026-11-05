@@ -14,6 +14,7 @@ import { normalizeCustomerPhone, validateRescheduleInput, canRequestReschedule, 
 import { cancellationMode, isCancellationReasonValid, validateCancellationDecision, validateCancellationReview, rollbackCancellation } from './cancellation-rules.js';
 import { HOLD_MINUTES, expireOverdueHolds, expireLockedHold, createHoldExpirationWorker } from './hold-expiration.js';
 import { syncVerifiedPayosPayment } from './payos-sync.js';
+import { recoverOrCreatePayosLink, PayosLinkError } from './payos-link.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -610,46 +611,44 @@ app.post('/api/payments/bookings/:code/create', rateLimit({windowMs:15*60*1000,l
       await client.query('ROLLBACK');return res.status(409).json({message:'Đơn không còn chờ thanh toán hoặc đã hết hạn.'});
     }
     const existing=await client.query('SELECT * FROM payos_payment_requests WHERE booking_id=$1',[b.id]);
-    if(existing.rowCount) {
+    if (existing.rowCount) {
+      orderCode = Number(existing.rows[0].order_code);
       await client.query('COMMIT');
-      const x=existing.rows[0];
-      // A previous attempt can reserve an orderCode before payOS returns a QR.
-      // Never return an empty QR or create a second payOS order blindly.
-      if (x.qr_code || x.checkout_url)
-        return res.json({qrContent:x.qr_code||'',checkoutUrl:x.checkout_url||'',orderCode:Number(x.order_code)});
-      try {
-        const remote=await payos.paymentRequests.get(Number(x.order_code));
-        if(remote?.qrCode || remote?.checkoutUrl) {
-          await pool.query(`UPDATE payos_payment_requests SET qr_code=$2,checkout_url=$3,updated_at=NOW()
-            WHERE order_code=$1`,[x.order_code,remote.qrCode||'',remote.checkoutUrl||'']);
-          return res.json({qrContent:remote.qrCode||'',checkoutUrl:remote.checkoutUrl||'',orderCode:Number(x.order_code)});
-        }
-      } catch(err) {
-        console.warn('payOS QR recovery not available:',err.message);
+      const x = existing.rows[0];
+      if (x.qr_code || x.checkout_url) {
+        return res.json({qrContent:x.qr_code||'',checkoutUrl:x.checkout_url||'',orderCode});
       }
-      return res.status(503).json({
-        message:'payOS chưa cung cấp mã QR cho giao dịch này. Vui lòng kiểm tra cấu hình hoặc liên hệ quán; không chuyển tiền khi chưa có QR hợp lệ.'
-      });
+      // An earlier payOS create may have failed after the DB reserved this code.
+      // The resolver will verify on payOS before safely reusing the SAME code.
+    } else {
+      const created = await client.query(`INSERT INTO payos_payment_requests(booking_id)
+        VALUES($1) RETURNING order_code`,[b.id]);
+      orderCode = Number(created.rows[0].order_code);
+      await client.query('COMMIT');
     }
-    // Insert first to reserve a unique orderCode, then call payOS outside the transaction.
-    const created=await client.query(`INSERT INTO payos_payment_requests(booking_id)
-      VALUES($1) RETURNING order_code`,[b.id]);
-    orderCode=Number(created.rows[0].order_code);
-    await client.query('COMMIT');
   } catch(e) {await client.query('ROLLBACK');throw e;} finally {client.release();}
   try {
-    const expires=Math.floor(new Date(b.hold_expires_at).getTime()/1000);
-    const data=await payos.paymentRequests.create({
-      orderCode,amount:b.amount_vnd,description:`HIBI ${orderCode}`,
-      returnUrl:`${PUBLIC_BASE_URL}/dat-lich`,cancelUrl:`${PUBLIC_BASE_URL}/dat-lich`,expiredAt:expires,
+    const link = await recoverOrCreatePayosLink(payos, {
+      orderCode, amount:Number(b.amount_vnd), holdExpiresAt:b.hold_expires_at,
+      returnUrl:`${PUBLIC_BASE_URL}/dat-lich`,cancelUrl:`${PUBLIC_BASE_URL}/dat-lich`,
     });
-    await pool.query(`UPDATE payos_payment_requests SET qr_code=$2,checkout_url=$3,updated_at=NOW()
-      WHERE order_code=$1`,[orderCode,data.qrCode,data.checkoutUrl]);
-    res.json({qrContent:data.qrCode,checkoutUrl:data.checkoutUrl,orderCode});
+    // Never persist a payable link if the hold has expired while payOS was responding.
+    const updated = await pool.query(`UPDATE payos_payment_requests AS p
+      SET qr_code=$3,checkout_url=$4,updated_at=NOW()
+      WHERE p.booking_id=$1 AND p.order_code=$2 AND EXISTS (
+        SELECT 1 FROM bookings b WHERE b.id=p.booking_id
+          AND b.status='PENDING_PAYMENT' AND b.payment_status='PENDING'
+          AND b.hold_expires_at > clock_timestamp()
+      )`, [b.id,orderCode,link.qrContent,link.checkoutUrl]);
+    if (!updated.rowCount) return res.status(409).json({message:'Đã hết thời gian giữ chỗ hoặc đơn không còn chờ thanh toán.'});
+    return res.json(link);
   } catch(err) {
-    // Preserve the reserved orderCode for reconciliation. Do not blindly create another order.
-    console.error('payOS create payment failed:',err.message);
-    res.status(502).json({message:'Chưa tạo được QR payOS. Vui lòng liên hệ quán để kiểm tra trước khi thử lại.'});
+    if (err instanceof PayosLinkError) {
+      const status = ['EXPIRED','NOT_PENDING','ORDER_MISMATCH','AMOUNT_MISMATCH','CURRENCY_MISMATCH'].includes(err.code) ? 409 : 503;
+      return res.status(status).json({message:err.message});
+    }
+    console.error('payOS link recovery failed:',err?.message);
+    return res.status(502).json({message:'Chưa thể kết nối payOS. Vui lòng thử lại sau.'});
   }
 }));
 

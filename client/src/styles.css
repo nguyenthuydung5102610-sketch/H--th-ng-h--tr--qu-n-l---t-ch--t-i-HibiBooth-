@@ -117,3 +117,35 @@ body,button,input,select,textarea{font-family:'Be Vietnam Pro',Arial,sans-serif}
 .reschedule-filter-row label { margin: 0; }
 .reschedule-filter-row > button { margin-bottom: 0; }
 @media (max-width: 720px) { .reschedule-filter-row { grid-template-columns: 1fr; } }
+
+
+/* COMMIT 10: grouped, keyboard-friendly admin navigation and compact mobile menu */
+.sidebar{padding:18px 12px 12px;overflow:hidden;}
+.admin-sidebar-header{display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
+.admin-brand{padding:3px 8px 15px;margin:0;min-width:0;}
+.admin-brand>span:last-child{font-size:.96rem;}
+.admin-brand small{font-size:.57rem;letter-spacing:.09em;}
+.sidebar-navigation{display:flex;flex-direction:column;flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#7c9a87 transparent;}
+.side-nav{display:flex;flex-direction:column;gap:0;flex-shrink:0;padding-bottom:12px;}
+.side-nav-group{display:flex;flex-direction:column;gap:3px;margin:0 0 10px;}
+.side-nav-group-heading{color:#a6bcad;letter-spacing:.12em;font-size:.59rem;font-weight:800;padding:9px 11px 5px;}
+.side-nav-group a{display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:10px;font-size:.78rem;min-height:39px;}
+.side-nav-group a.active{background:#ffffff27;color:#fff;box-shadow:inset 3px 0 0 #d9e7ca;}
+.side-nav-group a:focus-visible,.admin-menu-toggle:focus-visible{outline:3px solid #e2d69a;outline-offset:2px;}
+.side-nav-group a svg{flex-shrink:0;}
+.sidebar-bottom{margin-top:auto;padding-bottom:3px;}
+.admin-menu-toggle{display:none;background:transparent;border:1px solid #ffffff55;color:#fff;border-radius:10px;cursor:pointer;padding:8px;}
+@media(max-width:760px){
+  .sidebar{padding:10px 14px;height:auto;min-height:0;position:relative;}
+  .admin-sidebar-header{min-height:49px;}
+  .admin-brand{padding:4px;margin:0;}
+  .admin-menu-toggle{display:inline-flex;align-items:center;justify-content:center;}
+  .sidebar-navigation{display:none;overflow-y:visible;}
+  .sidebar.sidebar-open .sidebar-navigation{display:flex;}
+  .side-nav{display:flex;flex-direction:column;gap:0;overflow:visible;padding:6px 0 0;}
+  .side-nav-group{display:flex;flex-direction:column;gap:3px;margin-bottom:8px;}
+  .side-nav-group a{white-space:normal;font-size:.83rem;}
+  .sidebar-bottom{display:block;border-top:1px solid #ffffff25;margin-top:3px;}
+  .user-chip{border-top:0;}
+  .admin-topbar{height:53px;}
+}
