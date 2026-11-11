@@ -3,7 +3,7 @@ import { bookingStartMs, CHECKIN_LATE_MINUTES } from './business-rules.js';
 
 export function canRequestRefundAssistance(booking, nowMs = Date.now()) {
   if (!booking || booking.payment_status !== 'PAID') return false;
-  if (booking.status === 'NO_SHOW' || booking.status === 'CANCELLED') return true;
+  if (['NO_SHOW', 'CANCELLED', 'EXPIRED'].includes(booking.status)) return true;
   if (booking.status !== 'CONFIRMED') return false;
   const start = bookingStartMs(booking.booking_date, booking.time_slot);
   return Number.isFinite(start) && Number.isFinite(nowMs) && nowMs > start + CHECKIN_LATE_MINUTES * 60000;

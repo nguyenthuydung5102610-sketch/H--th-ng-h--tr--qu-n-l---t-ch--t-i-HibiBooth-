@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   package_id INTEGER NOT NULL REFERENCES packages(id),
   booking_date DATE NOT NULL,
   time_slot VARCHAR(20) NOT NULL,
+  duration_minutes INTEGER NOT NULL DEFAULT 30 CHECK (duration_minutes BETWEEN 1 AND 240),
   amount_vnd INTEGER NOT NULL CHECK (amount_vnd >= 0),
   status VARCHAR(24) NOT NULL DEFAULT 'PENDING_PAYMENT'
     CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN', 'CANCELLED', 'EXPIRED', 'NO_SHOW')),
@@ -44,6 +45,15 @@ CREATE TABLE IF NOT EXISTS bookings (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Existing sessions were sold as 60 minutes. Preserve that entitlement on upgrade;
+-- all NEW bookings default to 30 minutes. Re-running db:init must remain safe.
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE bookings ALTER COLUMN duration_minutes SET DEFAULT 30;
+
+-- Update only the old stock package wording, not prices or historical bookings.
+UPDATE packages SET description = REPLACE(description, '60 phút sử dụng phòng', '30 phút sử dụng phòng')
+WHERE description LIKE '%60 phút sử dụng phòng%';
+
 -- COMMIT 13: migrate existing installs without deleting bookings or payments.
 -- PostgreSQL's default name for the original inline CHECK is bookings_status_check.
 ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check;

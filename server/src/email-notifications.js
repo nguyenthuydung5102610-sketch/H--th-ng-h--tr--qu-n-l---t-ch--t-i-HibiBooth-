@@ -12,15 +12,15 @@ export function isValidCustomerEmail(input) {
     /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i.test(value);
 }
 
-export function googleCalendarUrl({ bookingDate, timeSlot, bookingCode, roomName = 'HIBI BOOTH' }) {
+export function googleCalendarUrl({ bookingDate, timeSlot, bookingCode, roomName = 'HIBI BOOTH', durationMinutes = 30 }) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(bookingDate)) || !/^\d{2}:\d{2}$/.test(String(timeSlot))) return '';
   const start = Date.parse(`${bookingDate}T${timeSlot}:00+07:00`);
-  if (!Number.isFinite(start)) return '';
+  if (!Number.isFinite(start) || !Number.isInteger(durationMinutes) || durationMinutes < 1 || durationMinutes > 240) return '';
   const utc = (ms) => new Date(ms).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
   const params = new URLSearchParams({
     action: 'TEMPLATE',
     text: 'Lịch chụp ảnh HIBI BOOTH',
-    dates: `${utc(start)}/${utc(start + 60 * 60_000)}`,
+    dates: `${utc(start)}/${utc(start + durationMinutes * 60_000)}`,
     stz: 'Asia/Ho_Chi_Minh',
     etz: 'Asia/Ho_Chi_Minh',
     details: `Mã đặt phòng: ${bookingCode}\nPhòng: ${roomName}\nĐến đúng giờ. Check-in trễ tối đa 20 phút.`,
@@ -31,13 +31,14 @@ export function googleCalendarUrl({ bookingDate, timeSlot, bookingCode, roomName
 
 export function emailMessage(kind, booking) {
   const { booking_code: code, customer_name: name, booking_date: date, time_slot: timeSlot, room_name: roomName } = booking;
+  const durationMinutes = Number(booking.duration_minutes ?? 30);
   const [year, month, day] = String(date).split('-');
-  const calendarLink = googleCalendarUrl({bookingDate:date, timeSlot, bookingCode:code, roomName});
+  const calendarLink = googleCalendarUrl({bookingDate:date, timeSlot, bookingCode:code, roomName, durationMinutes});
   const when = `${timeSlot} ngày ${day}/${month}/${year}`;
   return kind === 'CONFIRMATION'
     ? {
         subject: `HIBI BOOTH - Xác nhận đặt phòng ${code}`,
-        text: `Xin chào ${name},\n\nHIBI BOOTH xác nhận bạn đã thanh toán và đặt phòng thành công.\nMã đặt phòng: ${code}\nThời gian: ${when} (giờ Việt Nam)\nPhòng: ${roomName}\nThời lượng: 60 phút\n\nThêm lịch vào Google Calendar (bạn cần tự bấm Lưu):\n${calendarLink}\n\nVui lòng đến đúng giờ; check-in trễ tối đa 20 phút. Xuất trình mã đặt phòng hoặc QR check-in trên trang Tra cứu khi đến quán.\n\nHIBI BOOTH`,
+        text: `Xin chào ${name},\n\nHIBI BOOTH xác nhận bạn đã thanh toán và đặt phòng thành công.\nMã đặt phòng: ${code}\nThời gian: ${when} (giờ Việt Nam)\nPhòng: ${roomName}\nThời lượng: ${durationMinutes} phút\n\nThêm lịch vào Google Calendar (bạn cần tự bấm Lưu):\n${calendarLink}\n\nVui lòng đến đúng giờ; check-in trễ tối đa 20 phút. Xuất trình mã đặt phòng hoặc QR check-in trên trang Tra cứu khi đến quán.\n\nHIBI BOOTH`,
       }
     : {
         subject: `HIBI BOOTH - Nhắc lịch chụp ${code}`,
@@ -95,7 +96,7 @@ export async function processEmailNotifications(pool) {
       await client.query('BEGIN');
       const result=await client.query(`
         SELECT n.id,n.booking_id,n.kind,n.recipient_email,n.attempts,
-          b.booking_code,b.customer_name,b.booking_date::text AS booking_date,b.time_slot,
+          b.booking_code,b.customer_name,b.booking_date::text AS booking_date,b.time_slot,b.duration_minutes,
           b.status AS booking_status,b.payment_status,room.name AS room_name
         FROM email_notifications n
         JOIN bookings b ON b.id=n.booking_id JOIN rooms room ON room.id=b.room_id
@@ -146,7 +147,7 @@ export function rescheduleDecisionEmailMessage(job) {
   return {
     subject:`HIBI BOOTH - ${approved?'Đổi lịch đã được duyệt':'Yêu cầu đổi lịch bị từ chối'} - ${job.booking_code}`,
     text: approved
-      ? `Xin chào ${job.customer_name},\n\nYêu cầu đổi lịch ${job.booking_code} đã được duyệt.\nLịch cũ: ${original}.\nLịch mới: ${revised}.\nPhòng: ${job.room_name}.\n\nNếu bạn đã lưu lịch trên Google Calendar, vui lòng cập nhật sự kiện cũ.\nTạo sự kiện mới: ${googleCalendarUrl({bookingDate:job.new_booking_date,timeSlot:job.new_time_slot,bookingCode:job.booking_code,roomName:job.room_name})}\n\nHIBI BOOTH`
+      ? `Xin chào ${job.customer_name},\n\nYêu cầu đổi lịch ${job.booking_code} đã được duyệt.\nLịch cũ: ${original}.\nLịch mới: ${revised}.\nPhòng: ${job.room_name}.\n\nNếu bạn đã lưu lịch trên Google Calendar, vui lòng cập nhật sự kiện cũ.\nTạo sự kiện mới: ${googleCalendarUrl({bookingDate:job.new_booking_date,timeSlot:job.new_time_slot,bookingCode:job.booking_code,roomName:job.room_name,durationMinutes:Number(job.duration_minutes ?? 30)})}\n\nHIBI BOOTH`
       : `Xin chào ${job.customer_name},\n\nYêu cầu đổi lịch ${job.booking_code} không được phê duyệt.\nLý do: ${job.decision_reason || 'Không được chấp thuận'}.\nLịch ban đầu vẫn giữ nguyên: ${original}.\nBạn có thể tra cứu đơn để xem kết quả.\n\nHIBI BOOTH`,
   };
 }
@@ -162,7 +163,7 @@ export async function processRescheduleDecisionNotifications(pool) {
       const result=await client.query(`SELECT n.id,n.request_id,n.attempts,n.recipient_email,
         r.status AS decision_status,r.decision_reason,r.old_booking_date::text AS old_booking_date,
         r.old_time_slot,r.new_booking_date::text AS new_booking_date,r.new_time_slot,
-        b.booking_code,b.customer_name,room.name AS room_name
+        b.booking_code,b.customer_name,b.duration_minutes,room.name AS room_name
         FROM reschedule_decision_notifications n
         JOIN booking_reschedule_requests r ON r.id=n.request_id
         JOIN bookings b ON b.id=r.booking_id JOIN rooms room ON room.id=b.room_id

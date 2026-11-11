@@ -29,7 +29,7 @@ export async function expireLockedHold(client, bookingId) {
     RETURNING id,booking_code`, [bookingId]);
   if (!updated.rowCount) return false;
   await client.query(`INSERT INTO audit_logs(user_id,action,entity_type,entity_id,details)
-    VALUES(NULL,'HOLD_EXPIRED','BOOKING',$1,jsonb_build_object('bookingCode',$2,'reason','hold_timeout'))`,
+    VALUES(NULL,'HOLD_EXPIRED','BOOKING',$1,jsonb_build_object('bookingCode',$2::text,'reason','hold_timeout'))`,
     [String(updated.rows[0].id),updated.rows[0].booking_code]);
   return true;
 }

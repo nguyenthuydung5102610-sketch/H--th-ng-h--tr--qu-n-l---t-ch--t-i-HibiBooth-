@@ -6,7 +6,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { validCustomerName, isValidDate, isBookableAt, checkinWindow, formatBookingCode, isBookingCode, BOOKING_ADVANCE_MINUTES, slotsOverlap, canIssueCheckinQr } from './business-rules.js';
+import { validCustomerName, isValidDate, isBookableAt, checkinWindow, formatBookingCode, isBookingCode, BOOKING_ADVANCE_MINUTES, SESSION_MINUTES, isSessionWithinOpeningHours, slotsOverlap, canIssueCheckinQr } from './business-rules.js';
 import { scheduleBookingEmails, startEmailNotificationWorker, isValidCustomerEmail, emailServiceEnabled } from './email-notifications.js';
 import { pool, writeAudit } from './db.js';
 import { requireAuth, requireRole } from './auth.js';
@@ -19,6 +19,7 @@ import { parseCheckinCode, checkinEligibility, applyCheckin, CheckinError } from
 import { recordAttendance, attendanceEligibility, AttendanceError } from './attendance-rules.js';
 import { decideRefundTransaction, RefundDecisionError } from './refund-decision.js';
 import { canRequestRefundAssistance, validRefundAssistanceReason } from './refund-assistance.js';
+import { staffRefundEligibility } from './staff-refund-rules.js';
 
 if (!process.env.JWT_SECRET) {
   console.error('Thiếu JWT_SECRET. Hãy tạo server/.env từ server/.env.example.');
@@ -31,7 +32,6 @@ const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
 const DEMO_PAYMENT_ENABLED = process.env.ENABLE_DEMO_PAYMENT === 'true' && process.env.NODE_ENV !== 'production';
 const OPENING_HOUR = 9;
 const CLOSING_HOUR = 23;
-const SESSION_MINUTES = 60;
 const SLOT_INTERVAL_MINUTES = 30;
 
 const TIME_SLOTS = [];
@@ -54,9 +54,10 @@ app.use('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, stan
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const isText = (value, max = 255) => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= max;
 const maskPhone = (phone) => phone.length > 4 ? `${phone.slice(0, 3)}•••${phone.slice(-3)}` : '••••';
-const SLOT_DURATION_MINUTES = 60;
+const SLOT_DURATION_MINUTES = SESSION_MINUTES;
 const minuteOf = (slot) => { const [h,m]=String(slot).split(':').map(Number); return h*60+m; };
-const blockedSlots = (reserved) => TIME_SLOTS.filter(candidate => reserved.some(existing => slotsOverlap(candidate, existing, SLOT_DURATION_MINUTES)));
+const blockedSlots = (reserved) => TIME_SLOTS.filter(candidate => reserved.some(existing =>
+  slotsOverlap(candidate, existing.time_slot, SLOT_DURATION_MINUTES, Number(existing.duration_minutes))));
 const nowInVietnam = () => {
   const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
     timeZone:'Asia/Ho_Chi_Minh', year:'numeric',month:'2-digit',day:'2-digit',
@@ -91,13 +92,13 @@ app.get('/api/availability', asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Ngày hoặc phòng không hợp lệ.' });
   }
   const result = await pool.query(
-    `SELECT time_slot FROM bookings
+    `SELECT time_slot, duration_minutes FROM bookings
      WHERE booking_date = $1 AND room_id = $2
        AND status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN')
        AND (status <> 'PENDING_PAYMENT' OR hold_expires_at > NOW())`,
     [date, Number(roomId)],
   );
-  const occupiedSlots = blockedSlots(result.rows.map(row => row.time_slot));
+  const occupiedSlots = blockedSlots(result.rows);
   const unavailable = TIME_SLOTS.filter(slot =>
     occupiedSlots.includes(slot) || !isBookableAt(String(date), slot)
   );
@@ -136,7 +137,8 @@ app.post('/api/bookings', rateLimit({windowMs:15*60*1000,limit:20}), asyncHandle
     }
     const occupied = await client.query(
       `SELECT id FROM bookings WHERE room_id = $1 AND booking_date = $2
-       AND ABS((split_part(time_slot, ':', 1)::int * 60 + split_part(time_slot, ':', 2)::int) - $3) < $4
+       AND (split_part(time_slot, ':', 1)::int * 60 + split_part(time_slot, ':', 2)::int) < $3::int + $4::int
+       AND $3::int < (split_part(time_slot, ':', 1)::int * 60 + split_part(time_slot, ':', 2)::int) + duration_minutes
        AND status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN')
        AND (status <> 'PENDING_PAYMENT' OR hold_expires_at > NOW()) LIMIT 1`,
       [Number(roomId), date, minuteOf(timeSlot), SLOT_DURATION_MINUTES],
@@ -162,10 +164,10 @@ app.post('/api/bookings', rateLimit({windowMs:15*60*1000,limit:20}), asyncHandle
     const code = formatBookingCode(Number(number.rows[0].last_number), issueDate);
     const booking = await client.query(
       `INSERT INTO bookings (booking_code, customer_name, customer_phone, customer_email, room_id, package_id,
-        booking_date, time_slot, amount_vnd, hold_expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW() + ($10::int * INTERVAL '1 minute'))
+        booking_date, time_slot, duration_minutes, amount_vnd, hold_expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW() + ($11::int * INTERVAL '1 minute'))
        RETURNING id, booking_code, amount_vnd, status, payment_status, hold_expires_at`,
-      [code, customerName.trim(), customerPhone.trim(), customerEmail.trim().toLowerCase(), Number(roomId), Number(packageId), date, timeSlot, pack.rows[0].price_vnd, HOLD_MINUTES],
+      [code, customerName.trim(), customerPhone.trim(), customerEmail.trim().toLowerCase(), Number(roomId), Number(packageId), date, timeSlot, SESSION_MINUTES, pack.rows[0].price_vnd, HOLD_MINUTES],
     );
     await writeAudit(client, null, 'CUSTOMER_CREATE_BOOKING', 'BOOKING', booking.rows[0].id, { bookingCode: code });
     await client.query('COMMIT');
@@ -185,7 +187,7 @@ app.get('/api/bookings/lookup/:code', rateLimit({ windowMs: 15 * 60 * 1000, limi
   if (!/^(03|05|07|08|09)\d{8}$/.test(phone)) return res.status(400).json({ message: 'Vui lòng nhập số điện thoại đã đăng ký (10 chữ số).' });
   await expireOverdueHolds(pool,{limit:1,bookingCode:code});
   const result = await pool.query(
-    `SELECT b.booking_code, b.customer_name, b.customer_phone, b.booking_date::text AS booking_date, b.time_slot,
+    `SELECT b.booking_code, b.customer_name, b.customer_phone, b.booking_date::text AS booking_date, b.time_slot, b.duration_minutes,
             b.amount_vnd, b.status, b.payment_status, b.hold_expires_at, b.created_at,
             (clock_timestamp() > ((b.booking_date + b.time_slot::time) AT TIME ZONE 'Asia/Ho_Chi_Minh') + INTERVAL '20 minutes') AS checkin_overdue,
             cra.status AS refund_assistance_status,
@@ -359,7 +361,7 @@ app.get('/api/bookings/:code/reschedule-availability',
     if (!isValidDate(date)) return res.status(400).json({ message: 'Ngày đề xuất không hợp lệ.' });
 
     const found = await pool.query(
-      `SELECT id, room_id, status, payment_status, booking_date::text AS booking_date, time_slot
+      `SELECT id, room_id, status, payment_status, booking_date::text AS booking_date, time_slot, duration_minutes
        FROM bookings WHERE booking_code=$1 AND customer_phone=$2`, [code, phone]);
     if (!found.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn hoặc số điện thoại không khớp.' });
     const booking = found.rows[0];
@@ -367,11 +369,11 @@ app.get('/api/bookings/:code/reschedule-availability',
       return res.status(409).json({ message: 'Đơn không còn đủ điều kiện đổi lịch.' });
     }
     const booked = await pool.query(
-      `SELECT time_slot FROM bookings WHERE room_id=$1 AND booking_date=$2 AND id<>$3
+      `SELECT time_slot, duration_minutes FROM bookings WHERE room_id=$1 AND booking_date=$2 AND id<>$3
        AND status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN')
        AND (status <> 'PENDING_PAYMENT' OR hold_expires_at > NOW())`,
       [booking.room_id, date, booking.id]);
-    const unavailable = unavailableRescheduleSlots(TIME_SLOTS, booked.rows.map(row => row.time_slot), date);
+    const unavailable = unavailableRescheduleSlots(TIME_SLOTS, booked.rows, date, Date.now(), Number(booking.duration_minutes));
     // Moving to exactly the same date/time is not a valid reschedule request.
     if (date === booking.booking_date && !unavailable.includes(booking.time_slot)) unavailable.push(booking.time_slot);
     res.json({ date, timeSlots: TIME_SLOTS, unavailable });
@@ -395,10 +397,13 @@ app.post('/api/bookings/:code/reschedule-requests',
       const peek=await client.query('SELECT room_id FROM bookings WHERE booking_code=$1 AND customer_phone=$2',[code,phone]);
       if(!peek.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
       await client.query('SELECT id FROM rooms WHERE id=$1 FOR UPDATE',[peek.rows[0].room_id]);
-      const found=await client.query(`SELECT id,room_id,booking_date::text AS booking_date,time_slot,status,
+      const found=await client.query(`SELECT id,room_id,booking_date::text AS booking_date,time_slot,duration_minutes,status,
         payment_status FROM bookings WHERE booking_code=$1 AND customer_phone=$2 FOR UPDATE`,[code,phone]);
       if(!found.rowCount){await client.query('ROLLBACK');return res.status(404).json({message:'Không tìm thấy đơn hoặc số điện thoại không khớp.'});}
       const b=found.rows[0];
+      if(!isSessionWithinOpeningHours(newTimeSlot, Number(b.duration_minutes))){
+        await client.query('ROLLBACK');return res.status(400).json({message:'Khung giờ không đủ thời gian sử dụng trước giờ đóng cửa.'});
+      }
       if(!canRequestReschedule(b.status,b.payment_status)){
         await client.query('ROLLBACK');return res.status(409).json({message:'Chỉ đơn đã thanh toán, chưa check-in hoặc hủy mới được đổi lịch.'});
       }
@@ -410,10 +415,11 @@ app.post('/api/bookings/:code/reschedule-requests',
       }
       // Room lock prevents competing bookings in the destination slot.
       const occupied=await client.query(`SELECT id FROM bookings WHERE room_id=$1 AND booking_date=$2 AND id<>$3
-        AND ABS((split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) - $4) < $5
+        AND (split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) < $4::int + $5::int
+        AND $4::int < (split_part(time_slot, ':', 1)::int*60 + split_part(time_slot, ':', 2)::int) + duration_minutes
         AND status IN ('PENDING_PAYMENT','CONFIRMED','CHECKED_IN')
         AND (status <> 'PENDING_PAYMENT' OR hold_expires_at>NOW()) LIMIT 1`,
-        [b.room_id,newDate,b.id,minuteOf(newTimeSlot),SESSION_MINUTES]);
+        [b.room_id,newDate,b.id,minuteOf(newTimeSlot),Number(b.duration_minutes)]);
       if(occupied.rowCount){await client.query('ROLLBACK');return res.status(409).json({message:'Giờ mới vừa có khách đặt. Lịch cũ vẫn được giữ nguyên.'});}
       // Reject a race with check-in, a cancellation, or passage of the original start time.
       const updated=await client.query(`UPDATE bookings SET booking_date=$1,time_slot=$2,updated_at=NOW()
@@ -503,14 +509,14 @@ app.get('/api/payments/bookings/:code', asyncHandler(async (req, res) => {
   if (!isBookingCode(code)) return res.status(400).json({ message: 'Mã đơn không hợp lệ.' });
   await expireOverdueHolds(pool,{limit:1,bookingCode:code});
   const result = await pool.query(`SELECT b.booking_code,b.amount_vnd,b.status,b.payment_status,b.hold_expires_at,
-    b.booking_date::text AS booking_date,b.time_slot,r.name AS room_name,
+    b.booking_date::text AS booking_date,b.time_slot,b.duration_minutes,r.name AS room_name,
     p.qr_code,p.checkout_url FROM bookings b JOIN rooms r ON r.id=b.room_id LEFT JOIN payos_payment_requests p ON p.booking_id=b.id
     WHERE b.booking_code=$1`, [code]);
   if (!result.rowCount) return res.status(404).json({ message: 'Không tìm thấy đơn.' });
   const b = result.rows[0];
   res.json({ mode: PAYMENT_MODE, bookingCode:b.booking_code, amountVnd:b.amount_vnd,
     status:b.status, paymentStatus:b.payment_status, holdExpiresAt:b.hold_expires_at,
-    bookingDate:b.booking_date, timeSlot:b.time_slot, roomName:b.room_name, emailNotificationsEnabled:emailServiceEnabled(),
+    bookingDate:b.booking_date, timeSlot:b.time_slot, durationMinutes:b.duration_minutes, roomName:b.room_name, emailNotificationsEnabled:emailServiceEnabled(),
     qrContent:b.status==='PENDING_PAYMENT' ? (PAYOS_ENABLED ? (b.qr_code || '') : `HIBI-DEMO-ONLY|${b.booking_code}|${b.amount_vnd}`) : '',
     checkoutUrl: b.status==='PENDING_PAYMENT' && PAYOS_ENABLED ? b.checkout_url : null,
     note: PAYOS_ENABLED ? 'Chỉ khi payOS xác nhận giao dịch hợp lệ, đơn mới được xác nhận.' : 'QR mô phỏng – không thể chuyển khoản.' });
@@ -703,18 +709,27 @@ app.get('/api/staff/bookings', requireAuth, requireRole('EMPLOYEE'), asyncHandle
   if (date) { values.push(date); where.push(`b.booking_date=$${values.length}`); }
   if (q) { values.push(`%${String(q).slice(0,80)}%`); where.push(`(b.booking_code ILIKE $${values.length} OR b.customer_name ILIKE $${values.length} OR b.customer_phone ILIKE $${values.length})`); }
   const result = await pool.query(
-    `SELECT b.id, b.booking_code, b.customer_name, b.customer_phone, b.booking_date, b.time_slot,
+    `SELECT b.id, b.booking_code, b.customer_name, b.customer_phone, b.created_at, b.booking_date::text AS booking_date, b.time_slot,
        b.amount_vnd, b.status, b.payment_status, r.name AS room_name, p.name AS package_name,
-       ai.kind AS attendance_kind, ai.note AS attendance_note
+       ai.kind AS attendance_kind, ai.note AS attendance_note, clock_timestamp() AS db_now,
+       EXISTS(SELECT 1 FROM refunds rf WHERE rf.booking_id=b.id
+              AND rf.status IN ('PENDING_APPROVAL','APPROVED','COMPLETED')) AS refund_request_exists
      FROM bookings b JOIN rooms r ON r.id=b.room_id JOIN packages p ON p.id=b.package_id
      LEFT JOIN booking_attendance_incidents ai ON ai.booking_id=b.id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-     ORDER BY b.booking_date DESC, b.time_slot DESC LIMIT 300`, values,
+     ORDER BY b.created_at DESC, b.id DESC LIMIT 300`, values,
   );
-  res.json(result.rows.map(row => ({
-    ...row,
-    attendance_eligible: attendanceEligibility({ ...row, booking_date: row.booking_date.toISOString?.().slice(0,10) ?? row.booking_date }).allowed && !row.attendance_kind,
-  })));
+  res.json(result.rows.map(({ db_now, ...row }) => {
+    const nowMs = new Date(db_now).getTime();
+    const refund = staffRefundEligibility(row, nowMs);
+    return {
+      ...row,
+      attendance_eligible: attendanceEligibility(row, nowMs).allowed && !row.attendance_kind,
+      checkin_overdue: row.status === 'CONFIRMED' && row.payment_status === 'PAID'
+        && canRequestRefundAssistance(row, nowMs),
+      refund_request_eligible: refund.allowed,
+    };
+  }));
 }));
 
 // Validate before check-in. No database mutation, no audit entry.
@@ -803,14 +818,19 @@ app.post('/api/staff/bookings/:id/refunds', requireAuth, requireRole('EMPLOYEE')
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const bookingResult = await client.query('SELECT id,booking_code,amount_vnd,payment_status FROM bookings WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const bookingResult = await client.query(`SELECT id,booking_code,booking_date::text AS booking_date,
+      time_slot,status,amount_vnd,payment_status FROM bookings WHERE id=$1 FOR UPDATE`, [req.params.id]);
     if (!bookingResult.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Không tìm thấy đơn.' }); }
     const booking = bookingResult.rows[0];
-    if (booking.payment_status !== 'PAID') { await client.query('ROLLBACK'); return res.status(409).json({ message: 'Chỉ tạo yêu cầu hoàn tiền cho đơn đã thanh toán.' }); }
+    // Use DB time after locking the booking. A confirmed but not-yet-overdue
+    // booking cannot be refunded merely because it has a PAID transaction.
+    const nowResult = await client.query('SELECT clock_timestamp() AS db_now');
+    const eligibility = staffRefundEligibility(booking, new Date(nowResult.rows[0].db_now).getTime());
+    if (!eligibility.allowed) { await client.query('ROLLBACK'); return res.status(409).json({ message: eligibility.message }); }
     const amount = Number(amountVnd ?? booking.amount_vnd);
     if (!Number.isInteger(amount) || amount <= 0 || amount > booking.amount_vnd) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Số tiền hoàn không hợp lệ.' }); }
-    const pending = await client.query("SELECT id FROM refunds WHERE booking_id=$1 AND status='PENDING_APPROVAL'", [booking.id]);
-    if (pending.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ message: 'Đơn đã có yêu cầu hoàn tiền đang chờ duyệt.' }); }
+    const pending = await client.query("SELECT id FROM refunds WHERE booking_id=$1 AND status IN ('PENDING_APPROVAL','APPROVED','COMPLETED')", [booking.id]);
+    if (pending.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ message: 'Đơn đã có yêu cầu hoàn tiền đang xử lý hoặc đã được duyệt.' }); }
     const refund = await client.query(`INSERT INTO refunds (booking_id,requested_by,reason,amount_vnd)
       VALUES ($1,$2,$3,$4) RETURNING id,status,amount_vnd`, [booking.id, req.user.id, reason.trim(), amount]);
     await client.query(`UPDATE customer_refund_assistance SET status='FORWARDED',updated_at=NOW() WHERE booking_id=$1 AND status='OPEN'`,[booking.id]);

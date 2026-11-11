@@ -46,7 +46,8 @@ test('reschedule checks room lock, competing bookings and old booking start',()=
  const end=source.indexOf("app.get('/api/bookings/:code/reschedule-requests'",start);
  const route=source.slice(start,end);
  assert.match(route,/SELECT id FROM rooms WHERE id=\$1 FOR UPDATE/);
- assert.match(route,/ABS\(\(split_part\(time_slot/);
+ assert.match(route,/\+ duration_minutes/);
+ assert.match(route,/\$4::int < /);
  assert.match(route,/status='CONFIRMED' AND payment_status='PAID'/);
  assert.match(route,/ROLLBACK/);
 });

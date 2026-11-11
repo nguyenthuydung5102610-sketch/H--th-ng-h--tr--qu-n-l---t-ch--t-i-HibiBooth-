@@ -13,8 +13,8 @@ try {
       ('RED','Red Room','Phông đỏ nổi bật.')
     ON CONFLICT(code) DO NOTHING;
     INSERT INTO packages(code,name,description,price_vnd) VALUES
-      ('PHOTO4','Gói 4 ảnh','4 ảnh in · 60 phút sử dụng phòng.',70000),
-      ('PHOTO8','Gói 8 ảnh','8 ảnh in · 60 phút sử dụng phòng.',100000)
+      ('PHOTO4','Gói 4 ảnh','4 ảnh in · 30 phút sử dụng phòng.',70000),
+      ('PHOTO8','Gói 8 ảnh','8 ảnh in · 30 phút sử dụng phòng.',100000)
     ON CONFLICT(code) DO NOTHING;`);
   const owner=await pool.query("SELECT id FROM users WHERE role='OWNER' AND active=TRUE LIMIT 1");
   if (!owner.rowCount) {

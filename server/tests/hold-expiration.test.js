@@ -185,3 +185,24 @@ test('worker stops cleanly and ignores subsequent ticks',async()=>{
   worker.stop();
   assert.deepEqual(await worker.tick(),{skipped:true});
 });
+
+// Regression: PostgreSQL cannot infer the type of $2 in jsonb_build_object
+// because it accepts a variadic ANY argument (SQLSTATE 42P18).
+test('expiry audit explicitly types booking code for PostgreSQL JSONB (42P18)', async()=>{
+  let auditCalled=false;
+  const client={
+    async query(sql, params=[]) {
+      if(sql.trim().startsWith('UPDATE bookings')) {
+        assert.deepEqual(params,[12]);
+        return {rowCount:1,rows:[{id:12,booking_code:'HB-TEST'}]};
+      }
+      assert.match(sql,/INSERT INTO audit_logs/);
+      assert.match(sql,/jsonb_build_object\('bookingCode',\$2::text,/);
+      assert.deepEqual(params,['12','HB-TEST']);
+      auditCalled=true;
+      return {rowCount:1};
+    },
+  };
+  assert.equal(await expireLockedHold(client,12),true);
+  assert.equal(auditCalled,true);
+});

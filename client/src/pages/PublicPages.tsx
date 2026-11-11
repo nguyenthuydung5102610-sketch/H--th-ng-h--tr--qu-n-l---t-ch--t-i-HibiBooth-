@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { ArrowRight, CalendarDays, CalendarPlus, Camera, CheckCircle2, Clock3, MapPin, Search, ShieldCheck, Sparkles } from 'lucide-react';
@@ -15,13 +15,13 @@ type BookingResult = {
 };
 type LookupBooking = {
   booking_code: string; customer_name: string; customer_phone: string; booking_date: string;
-  time_slot: string; amount_vnd: number; status: string; payment_status: string;
+  time_slot: string; duration_minutes?: number; amount_vnd: number; status: string; payment_status: string;
   room_name: string; package_name: string; qr_content: string | null;
   checkin_overdue?: boolean; refund_assistance_available?: boolean; refund_assistance_status?: string | null;
 };
 type RescheduleRequest = { id:number; status:string; old_booking_date:string; old_time_slot:string; new_booking_date:string; new_time_slot:string; reason:string; decision_reason:string|null; created_at:string; reviewed_at:string|null };
 type PaymentInfo = {mode:string;qrContent:string;note:string;status:string;paymentStatus:string;
-  holdExpiresAt:string;checkoutUrl?:string|null;bookingDate?:string;timeSlot?:string;
+  holdExpiresAt:string;checkoutUrl?:string|null;bookingDate?:string;timeSlot?:string;durationMinutes?:number;
   roomName?:string;emailNotificationsEnabled?:boolean};
 const money = (n: number) => new Intl.NumberFormat('vi-VN').format(n) + 'đ';
 const today = () => { const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {timeZone:'Asia/Ho_Chi_Minh',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date()).filter(p=>p.type!=='literal').map(p=>[p.type,p.value])); return `${parts.year}-${parts.month}-${parts.day}`; }; 
@@ -87,19 +87,22 @@ export function BookingPage() {
     const timer = window.setInterval(() => setTick(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  // One source of truth for QR loading, including retries and returning to a pending booking.
-  // Never mark a booking paid without a verified response from the backend.
+  // Only the newest QR load may update the page. The provider may finish creating
+  // a link after a temporary proxy timeout; recover via GET, never create again.
+  const paymentLoadId = useRef(0);
   async function loadPaymentDetails(code: string) {
+    const loadId = ++paymentLoadId.current;
     setQrLoading(true);
     setPaymentMessage('');
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    const timeout = window.setTimeout(() => controller.abort(), 18000);
     try {
       const data = await api<PaymentInfo & { amountVnd: number; bookingCode: string }>(
         `/payments/bookings/${code}`, { signal: controller.signal },
       );
+      if (loadId !== paymentLoadId.current) return;
       setPaymentInfo(data);
-      // Server status is authoritative even on QR retry or returning to a pending booking.
+      // Server status is authoritative, including when the browser returns to a booking.
       setBooking(current => current && current.booking_code !== data.bookingCode ? current : {
         id: current?.id || 0, booking_code: data.bookingCode, amount_vnd: data.amountVnd,
         status: data.status, payment_status: data.paymentStatus,
@@ -107,22 +110,47 @@ export function BookingPage() {
       });
       if (data.mode === 'PAYOS' && data.status === 'PENDING_PAYMENT'
           && !data.qrContent && !data.checkoutUrl) {
-        const qr = await api<{ qrContent: string; checkoutUrl: string }>(
-          `/payments/bookings/${code}/create`,
-          { method: 'POST', signal: controller.signal },
-        );
-        if (!qr.qrContent && !qr.checkoutUrl) {
-          throw new Error('payOS chưa trả về mã QR. Vui lòng thử lại hoặc liên hệ quán.');
+        try {
+          const qr = await api<{ qrContent: string; checkoutUrl: string }>(
+            `/payments/bookings/${code}/create`,
+            { method: 'POST', signal: controller.signal },
+          );
+          if (!qr.qrContent && !qr.checkoutUrl) {
+            throw new Error('payOS chưa trả về mã QR hoặc đường dẫn thanh toán hợp lệ.');
+          }
+          if (loadId === paymentLoadId.current) {
+            setPaymentInfo({ ...data, ...qr });
+            setPaymentMessage('');
+          }
+        } catch (createError) {
+          // GET is read-only. This covers cases where payOS created the link,
+          // but a transient proxy disconnect prevented the POST reply arriving.
+          const recoveryController = new AbortController();
+          const recoveryTimeout = window.setTimeout(() => recoveryController.abort(), 5000);
+          try {
+            const latest = await api<PaymentInfo>(
+              `/payments/bookings/${code}`, { signal: recoveryController.signal },
+            );
+            if (loadId !== paymentLoadId.current) return;
+            setPaymentInfo(latest);
+            if (latest.qrContent || latest.checkoutUrl || latest.paymentStatus === 'PAID') {
+              setPaymentMessage('');
+              return;
+            }
+          } catch { /* GET failed as well: show the original error below. */ }
+          finally { window.clearTimeout(recoveryTimeout); }
+          throw createError;
         }
-        setPaymentInfo({ ...data, ...qr });
       }
     } catch (e) {
-      setPaymentMessage(controller.signal.aborted
-        ? 'Quá thời gian tải QR. Vui lòng thử lại. Không chuyển tiền khi QR chưa xuất hiện.'
-        : e instanceof Error ? e.message : 'Không tải được QR thanh toán.');
+      if (loadId === paymentLoadId.current) {
+        setPaymentMessage(controller.signal.aborted
+          ? 'Kết nối thanh toán bị gián đoạn. Vui lòng thử kiểm tra lại mã QR.'
+          : e instanceof Error ? e.message : 'Không tải được QR thanh toán.');
+      }
     } finally {
       window.clearTimeout(timeout);
-      setQrLoading(false);
+      if (loadId === paymentLoadId.current) setQrLoading(false);
     }
   }
 
@@ -144,23 +172,35 @@ export function BookingPage() {
   const selectedPackage = catalog?.packages.find((p) => String(p.id) === packageId);
   const availableSlots = useMemo(() => (catalog?.timeSlots || []).filter((slot) => !unavailable.includes(slot)), [catalog, unavailable]);
 
+  const pollBusyRef = useRef(false);
   useEffect(() => {
-    if (!booking || booking.payment_status==='PAID') return;
-    const timer=window.setInterval(async () => {
+    if (!booking || booking.payment_status === 'PAID') return;
+    const code = booking.booking_code;
+    const timer = window.setInterval(async () => {
+      if (pollBusyRef.current) return;
+      pollBusyRef.current = true;
       try {
-        // Backend checks the payment with payOS, even when the webhook cannot reach localhost.
-        if(paymentInfo?.mode==='PAYOS') {
-          try { await post(`/payments/bookings/${booking.booking_code}/reconcile`); } catch { /* do not mark as paid without server confirmation */ }
+        // Do not reconcile an orderCode before payOS has a payment link.
+        // A 101 (order not found) at this stage is not proof of a failed payment.
+        if (paymentInfo?.mode === 'PAYOS' && (paymentInfo.qrContent || paymentInfo.checkoutUrl)) {
+          try { await post(`/payments/bookings/${code}/reconcile`); }
+          catch { /* only the backend can confirm a payment */ }
         }
-        const data = await api<PaymentInfo>(`/payments/bookings/${booking.booking_code}`);
-        setPaymentInfo(current => ({...current,...data,qrContent:data.qrContent || current?.qrContent || ''}));
-        if (data.paymentStatus==='PAID' || data.status==='EXPIRED') {
-          setBooking(current => current ? {...current,status:data.status,payment_status:data.paymentStatus}:current);
+        const data = await api<PaymentInfo>(`/payments/bookings/${code}`);
+        setPaymentInfo(data);
+        if (data.qrContent || data.checkoutUrl || data.paymentStatus === 'PAID') {
+          setPaymentMessage('');
         }
-      } catch { /* lỗi mạng tạm thời, người dùng có thể tra cứu lại */ }
+        if (data.paymentStatus === 'PAID' || data.status === 'EXPIRED') {
+          setBooking(current => current && current.booking_code === code
+            ? { ...current, status:data.status, payment_status:data.paymentStatus } : current);
+        }
+      } catch { /* mạng lỗi tạm thời: không tự đổi trạng thái thanh toán */ }
+      finally { pollBusyRef.current = false; }
     }, 10000);
     return () => window.clearInterval(timer);
-  }, [booking?.booking_code, booking?.payment_status, paymentInfo?.mode]);
+  }, [booking?.booking_code, booking?.payment_status, paymentInfo?.mode,
+      paymentInfo?.qrContent, paymentInfo?.checkoutUrl]);
   const secondsLeft = Math.max(0, Math.floor((new Date(paymentInfo?.holdExpiresAt || booking?.hold_expires_at || Date.now()).getTime()-tick)/1000));
   // Do not display a payable QR after the local countdown ends; the API verifies the final status.
   const holdTimedOut = booking?.status==='PENDING_PAYMENT' && secondsLeft===0;
@@ -193,6 +233,8 @@ export function BookingPage() {
     try {
       const result = await post<BookingResult>('/bookings', { customerName:name, customerPhone:normalizedPhone, customerEmail:email.trim().toLowerCase(), roomId:Number(roomId), packageId:Number(packageId), date, timeSlot });
       sessionStorage.setItem('hibi_active_booking', result.booking_code);
+      ++paymentLoadId.current; // Ignore previous booking's late QR response.
+      setPaymentInfo(null);
       setBooking(result); setUnavailable((current) => [...current, timeSlot]);
       await loadPaymentDetails(result.booking_code);
     } catch (e) { setError(e instanceof Error ? e.message : 'Không thể tạo đơn.'); }
@@ -209,7 +251,7 @@ export function BookingPage() {
 
   const calendarUrl = paymentInfo?.bookingDate && paymentInfo.timeSlot
     ? googleCalendarLink({date:paymentInfo.bookingDate,timeSlot:paymentInfo.timeSlot,
-        bookingCode:booking?.booking_code || '',roomName:paymentInfo.roomName}) : '';
+        bookingCode:booking?.booking_code || '',roomName:paymentInfo.roomName,durationMinutes:paymentInfo.durationMinutes}) : '';
 
   if (booking) return <section className="narrow-page">
     <div className="page-intro"><span className="eyebrow">HIBI BOOTH · THANH TOÁN</span>
@@ -248,14 +290,14 @@ export function BookingPage() {
         <div><small>Thanh toán</small><strong>{booking.payment_status==='PAID'?paymentInfo?.mode==='PAYOS'?'Đã thanh toán':'Đã thanh toán (demo)':'Chưa thanh toán'}</strong></div>
         <div><small>Số tiền</small><strong>{money(booking.amount_vnd)}</strong></div>
         <div><small>Mã đối chiếu</small><strong>{booking.booking_code}</strong></div></div>
-      {paymentMessage && <div className="error-box" role="alert">{paymentMessage}</div>}
+      {paymentMessage && !(paymentInfo?.qrContent || paymentInfo?.checkoutUrl) && <div className="error-box" role="alert">{paymentMessage}</div>}
       <Link to="/tra-cuu" className="button light full">Tra cứu đơn đặt phòng</Link>
-      <button type="button" className="button light full" onClick={()=>{sessionStorage.removeItem("hibi_active_booking");setBooking(null);setPaymentInfo(null);setPaymentMessage("");setQrLoading(false);setTimeSlot("");}}>Đặt thêm lịch khác</button>
+      <button type="button" className="button light full" onClick={()=>{++paymentLoadId.current;sessionStorage.removeItem("hibi_active_booking");setBooking(null);setPaymentInfo(null);setPaymentMessage("");setQrLoading(false);setTimeSlot("");}}>Đặt thêm lịch khác</button>
     </div>
   </section>;
 
-  return <section className="page-wrap"><div className="page-intro"><span className="eyebrow">ĐẶT CHỖ TRỰC TUYẾN</span><h1>Chọn buổi chụp của bạn.</h1><p>HIBI mở cửa 09:00–23:00 hằng ngày · Mỗi lượt 60 phút · Đặt trước ít nhất 30 phút.</p></div><div className="booking-grid"><form className="panel form-panel" onSubmit={submit} noValidate><div className="form-attention">Vui lòng chọn đầy đủ ngày, phòng, khung giờ, gói chụp và nhập thông tin liên hệ trước khi tiếp tục.</div>{error && <div className="error-box" role="alert">{error}</div>}
-    <div className="form-section"><h3><span className="step-number">1</span> Ngày và khung giờ</h3><div className="booking-date-field"><label>Ngày chụp<input type="date" min={today()} value={date} onChange={(e)=>{setDate(e.target.value);setTimeSlot('');}} required/></label></div><div className="room-picker"><div className="room-picker-heading"><strong>Chọn phòng và màu phông nền</strong><span className="field-hint">Bấm vào mẫu màu bạn thích để chọn phòng.</span></div><div className="room-options" role="group" aria-label="Chọn màu phông phòng chụp">{catalog?.rooms.map((room) => { const tone=roomTone(room.code); const selected=roomId===String(room.id); return <button type="button" key={room.id} className={`room-option ${selected?'selected':''}`} aria-pressed={selected} onClick={()=>{setRoomId(String(room.id));setTimeSlot('');setUnavailable([]);}}><span className={`room-preview ${tone.preview}`} aria-hidden="true"><span className="room-preview-photo"><span className="room-preview-person"/></span></span><span className="room-option-details"><strong>{tone.label}</strong><small>{tone.mood}</small><span className="room-option-name">{room.name}</span></span>{selected && <CheckCircle2 className="room-option-check" size={21} aria-hidden="true"/>}</button>; })}</div><small className="field-hint room-picker-note">Mẫu màu để hình dung phông nền; màu trong ảnh thực tế có thể thay đổi theo ánh sáng.</small>{roomId && <p className="room-description">{catalog?.rooms.find(r=>String(r.id)===roomId)?.description}</p>}</div><div className="form-field"><strong>Chọn khung giờ</strong><div className="time-slot-grid" role="group" aria-label="Chọn khung giờ">{catalog?.timeSlots.map(slot => <button type="button" key={slot} className={`time-slot ${timeSlot===slot?'selected':''}`} aria-pressed={timeSlot===slot} onClick={()=>setTimeSlot(slot)} disabled={unavailable.includes(slot) || !roomId || !date} title={unavailable.includes(slot)?"Khung giờ không còn khả dụng":""}>{slot}{unavailable.includes(slot)?" · Kín":""}</button>)}</div><small className="field-hint">Giờ mở cửa 09:00–23:00, mỗi lượt 60 phút. Giờ bắt đầu cuối 22:00.</small></div>{catalog && roomId && date && availableSlots.length===0 && <div className="notice">Ngày này đã kín lịch ở phòng đang chọn. Hãy thử ngày hoặc phòng khác.</div>}</div>
+  return <section className="page-wrap"><div className="page-intro"><span className="eyebrow">ĐẶT CHỖ TRỰC TUYẾN</span><h1>Chọn buổi chụp của bạn.</h1><p>HIBI mở cửa 09:00–23:00 hằng ngày · Mỗi lượt 30 phút · Đặt trước ít nhất 30 phút.</p></div><div className="booking-grid"><form className="panel form-panel" onSubmit={submit} noValidate><div className="form-attention">Vui lòng chọn đầy đủ ngày, phòng, khung giờ, gói chụp và nhập thông tin liên hệ trước khi tiếp tục.</div>{error && <div className="error-box" role="alert">{error}</div>}
+    <div className="form-section"><h3><span className="step-number">1</span> Ngày và khung giờ</h3><div className="booking-date-field"><label>Ngày chụp<input type="date" min={today()} value={date} onChange={(e)=>{setDate(e.target.value);setTimeSlot('');}} required/></label></div><div className="room-picker"><div className="room-picker-heading"><strong>Chọn phòng và màu phông nền</strong><span className="field-hint">Bấm vào mẫu màu bạn thích để chọn phòng.</span></div><div className="room-options" role="group" aria-label="Chọn màu phông phòng chụp">{catalog?.rooms.map((room) => { const tone=roomTone(room.code); const selected=roomId===String(room.id); return <button type="button" key={room.id} className={`room-option ${selected?'selected':''}`} aria-pressed={selected} onClick={()=>{setRoomId(String(room.id));setTimeSlot('');setUnavailable([]);}}><span className={`room-preview ${tone.preview}`} aria-hidden="true"><span className="room-preview-photo"><span className="room-preview-person"/></span></span><span className="room-option-details"><strong>{tone.label}</strong><small>{tone.mood}</small><span className="room-option-name">{room.name}</span></span>{selected && <CheckCircle2 className="room-option-check" size={21} aria-hidden="true"/>}</button>; })}</div><small className="field-hint room-picker-note">Mẫu màu để hình dung phông nền; màu trong ảnh thực tế có thể thay đổi theo ánh sáng.</small>{roomId && <p className="room-description">{catalog?.rooms.find(r=>String(r.id)===roomId)?.description}</p>}</div><div className="form-field"><strong>Chọn khung giờ</strong><div className="time-slot-grid" role="group" aria-label="Chọn khung giờ">{catalog?.timeSlots.map(slot => <button type="button" key={slot} className={`time-slot ${timeSlot===slot?'selected':''}`} aria-pressed={timeSlot===slot} onClick={()=>setTimeSlot(slot)} disabled={unavailable.includes(slot) || !roomId || !date} title={unavailable.includes(slot)?"Khung giờ không còn khả dụng":""}>{slot}{unavailable.includes(slot)?" · Kín":""}</button>)}</div><small className="field-hint">Giờ mở cửa 09:00–23:00, mỗi lượt 30 phút. Giờ bắt đầu cuối 22:30.</small></div>{catalog && roomId && date && availableSlots.length===0 && <div className="notice">Ngày này đã kín lịch ở phòng đang chọn. Hãy thử ngày hoặc phòng khác.</div>}</div>
     <div className="form-section"><h3><span className="step-number">2</span> Chọn gói chụp</h3><p className="field-hint">Vui lòng chọn một gói chụp bên dưới.</p><div className="select-cards">{catalog?.packages.map((item)=><button type="button" key={item.id} className={`select-card ${packageId===String(item.id)?'selected':''}`} onClick={()=>setPackageId(String(item.id))}><strong>{item.name}</strong><span>{money(item.price_vnd)}</span><small>{item.description}</small></button>)}</div></div>
     <div className="form-section"><h3><span className="step-number">3</span> Thông tin liên hệ</h3><div className="form-row"><label>Họ và tên<input value={name} onChange={(e)=>setName(e.target.value)} maxLength={120} autoComplete="name" placeholder="Nguyễn Văn A" required/></label><label>Số điện thoại<input value={phone} onChange={(e)=>setPhone(e.target.value)} maxLength={30} autoComplete="tel" type="tel" placeholder="09xx xxx xxx" required/></label></div><label>Email nhận xác nhận và nhắc lịch<input type="email" value={email} onChange={(e)=>setEmail(e.target.value)} maxLength={254} autoComplete="email" placeholder="ban@example.com" required/></label><small className="field-hint">Số điện thoại dùng để tra cứu và đối chiếu đơn. Email dùng để gửi xác nhận và nhắc lịch khi quán kích hoạt dịch vụ gửi email.</small></div>
     {error && <div className="error-box" role="alert">{error}</div>}<button className="button primary full" type="submit" disabled={loading || !catalog}>{loading?'Đang tạo đơn...':'Kiểm tra và giữ chỗ'}</button><p className="tiny-note">Đặt lịch trước ít nhất 30 phút · Giữ chỗ tối đa 20 phút · Check-in trễ tối đa 20 phút. Hệ thống lên lịch nhắc qua email trước giờ chụp 60 phút (hoặc sau xác nhận nếu đặt sát giờ); việc gửi thực tế cần kích hoạt nhà cung cấp email.</p>
@@ -387,7 +429,7 @@ export function LookupPage() {
       {error&&<div className="error-box" role="alert">{error}</div>}{message&&<div className="notice" role="status">{message}</div>}
       {booking&&<div className="lookup-result"><div className="lookup-heading"><div><span className="eyebrow">{booking.booking_code}</span><h3>{booking.customer_name}</h3></div><span className={`status status-${booking.status.toLowerCase()}`}>{paidLate?'Quá giờ check-in':statusLabel[booking.status]||booking.status}</span></div>
         <div className="info-grid"><div><small>Ngày chụp</small><strong>{new Date(`${booking.booking_date}T00:00:00`).toLocaleDateString('vi-VN')}</strong></div><div><small>Khung giờ</small><strong>{booking.time_slot}</strong></div><div><small>Phòng</small><strong>{booking.room_name}</strong></div><div><small>Gói chụp</small><strong>{booking.package_name}</strong></div><div><small>Số điện thoại</small><strong>{booking.customer_phone}</strong></div><div><small>Thanh toán</small><strong>{booking.payment_status}</strong></div></div>
-        {booking.qr_content && booking.payment_status==='PAID' && !paidLate && ['CONFIRMED','CHECKED_IN'].includes(booking.status) ? <><div className="lookup-qr"><QRCodeSVG value={booking.qr_content} size={160}/><span>Xuất trình mã QR này khi đến quán.</span></div><a className="button calendar-button full" target="_blank" rel="noopener noreferrer" href={googleCalendarLink({date:booking.booking_date,timeSlot:booking.time_slot,bookingCode:booking.booking_code,roomName:booking.room_name})}><CalendarPlus size={18}/> Thêm vào Google Calendar</a></> : <div className="notice notice-info">{paidLate?'Đã quá 20 phút kể từ giờ hẹn. Nhân viên sẽ xác nhận tình trạng đến trễ hoặc không đến; bạn có thể đề nghị xem xét hoàn tiền bên dưới.':booking.status==='NO_SHOW'?'Đã ghi nhận khách không đến. Bạn có thể đề nghị xem xét hoàn tiền bên dưới.':booking.status==='EXPIRED'?'Đơn giữ chỗ chưa thanh toán đã hết hạn, không thể cấp mã check-in.':'Mã QR check-in chỉ hiển thị khi đơn đã thanh toán và còn trong thời gian hợp lệ.'}</div>}
+        {booking.qr_content && booking.payment_status==='PAID' && !paidLate && ['CONFIRMED','CHECKED_IN'].includes(booking.status) ? <><div className="lookup-qr"><QRCodeSVG value={booking.qr_content} size={160}/><span>Xuất trình mã QR này khi đến quán.</span></div><a className="button calendar-button full" target="_blank" rel="noopener noreferrer" href={googleCalendarLink({date:booking.booking_date,timeSlot:booking.time_slot,bookingCode:booking.booking_code,roomName:booking.room_name,durationMinutes:booking.duration_minutes})}><CalendarPlus size={18}/> Thêm vào Google Calendar</a></> : <div className="notice notice-info">{paidLate?'Đã quá 20 phút kể từ giờ hẹn. Nhân viên sẽ xác nhận tình trạng đến trễ hoặc không đến; bạn có thể đề nghị xem xét hoàn tiền bên dưới.':booking.status==='NO_SHOW'?'Đã ghi nhận khách không đến. Bạn có thể đề nghị xem xét hoàn tiền bên dưới.':booking.status==='EXPIRED'?'Đơn giữ chỗ chưa thanh toán đã hết hạn, không thể cấp mã check-in.':'Mã QR check-in chỉ hiển thị khi đơn đã thanh toán và còn trong thời gian hợp lệ.'}</div>}
         {(booking.refund_assistance_available || booking.refund_assistance_status) && <section className="lookup-refund-support" aria-label="Hỗ trợ hoàn tiền">
           <h3>Hoàn tiền</h3>
           <p>Đơn đã thanh toán nhưng không còn trong thời gian check-in hoặc đã hủy. Bạn có thể đề nghị quán xem xét hoàn tiền; nhân viên tiếp nhận và chủ quán phê duyệt riêng. <strong>Không tự động hoàn tiền.</strong></p>

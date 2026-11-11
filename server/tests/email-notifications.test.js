@@ -15,9 +15,11 @@ test('Google Calendar event preserves Vietnam local booking time, duration and c
   const u=new URL(url);
   assert.equal(u.host,'calendar.google.com');
   assert.equal(u.searchParams.get('action'),'TEMPLATE');
-  assert.equal(u.searchParams.get('dates'),'20261106T083000Z/20261106T093000Z');
+  assert.equal(u.searchParams.get('dates'),'20261106T083000Z/20261106T090000Z');
   assert.equal(u.searchParams.get('stz'),'Asia/Ho_Chi_Minh');
   assert.match(u.searchParams.get('details'),/HB-111062026/);
+  const oldUrl=googleCalendarUrl({bookingDate:'2026-11-06',timeSlot:'15:30',bookingCode:'HB-111062026',durationMinutes:60});
+  assert.equal(new URL(oldUrl).searchParams.get('dates'),'20261106T083000Z/20261106T093000Z');
   assert.equal(googleCalendarUrl({bookingDate:'wrong',timeSlot:'15:30',bookingCode:'HB-1'}),'');
 });
 
