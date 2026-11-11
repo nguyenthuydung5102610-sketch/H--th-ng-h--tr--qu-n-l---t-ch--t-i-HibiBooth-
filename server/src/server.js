@@ -1,3 +1,4 @@
+import { randomInt } from 'node:crypto';
 import 'dotenv/config';
 import express from 'express';
 import { PayOS } from '@payos/node';
@@ -548,12 +549,41 @@ app.post('/api/payments/bookings/:code/create', rateLimit({windowMs:15*60*1000,l
       }
       // An earlier payOS create may have failed after the DB reserved this code.
       // The resolver will verify on payOS before safely reusing the SAME code.
-    } else {
-      const created = await client.query(`INSERT INTO payos_payment_requests(booking_id)
-        VALUES($1) RETURNING order_code`,[b.id]);
-      orderCode = Number(created.rows[0].order_code);
-      await client.query('COMMIT');
+    
+} else {
+  let created = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = randomInt(
+      1_000_000_000_000,
+      9_000_000_000_000
+    );
+
+    const result = await client.query(
+      `INSERT INTO payos_payment_requests
+         (booking_id, order_code)
+       VALUES ($1, $2)
+       ON CONFLICT (order_code) DO NOTHING
+       RETURNING order_code`,
+      [b.id, candidate]
+    );
+
+    if (result.rowCount > 0) {
+      created = result.rows[0];
+      break;
     }
+  }
+
+  if (!created) {
+    throw new Error(
+      'Không thể tạo mã giao dịch payOS duy nhất.'
+    );
+  }
+
+  orderCode = Number(created.order_code);
+  await client.query('COMMIT');
+}
+
   } catch(e) {await client.query('ROLLBACK');throw e;} finally {client.release();}
   try {
     const link = await recoverOrCreatePayosLink(payos, {
